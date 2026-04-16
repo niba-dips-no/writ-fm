@@ -499,8 +499,7 @@ def start_api_thread(track_info: dict, encoder_getter, listener_fn) -> threading
             with ReusableTCPServer(("", PORT), NowPlayingHandler) as httpd:
                 httpd.serve_forever()
         except OSError as e:
-            from stream_gapless import log
-            log(f"API server failed to start: {e}")
+            print(f"API server failed to start: {e}", flush=True)
 
     t = threading.Thread(target=_serve, daemon=True)
     t.start()

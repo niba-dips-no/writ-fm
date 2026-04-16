@@ -18,11 +18,11 @@ WRIT-FM is a talk-first internet radio station where:
 ┌──────────────────────────────────────────────────────────────┐
 │  writ CLI                     (tmux-based process manager)   │
 ├──────────────────────────────────────────────────────────────┤
-│  stream_gapless.py                                           │
-│    ├── Plays talk segments per current show schedule          │
-│    ├── Inserts AI music bumpers between segments             │
-│    ├── Pipes gapless PCM audio to ffmpeg encoder             │
-│    ├── Streams to Icecast                                    │
+│  ezstream + feeder.py                                        │
+│    ├── ezstream: Icecast source client (Ogg Vorbis)          │
+│    ├── feeder.py: builds playlists per show schedule          │
+│    ├── Interleaves talk segments with AI music bumpers        │
+│    ├── Detects new content and reloads playlist (SIGHUP)      │
 │    └── Runs API server as daemon thread (:8001)              │
 ├──────────────────────────────────────────────────────────────┤
 │  Icecast :8000 ──► cloudflared tunnel ──► public URL         │
@@ -48,7 +48,7 @@ WRIT-FM is a talk-first internet radio station where:
 curl -LsSf https://astral.sh/uv/install.sh | sh
 
 # Install system dependencies (macOS)
-brew install icecast ffmpeg
+brew install icecast ffmpeg ezstream vorbis-tools
 
 # Set up Python environment
 uv sync
@@ -193,19 +193,18 @@ The listener daemon polls for new messages every 30 seconds and generates spoken
 ├── writ                        # Station CLI (start/stop/status/logs/generate)
 ├── run_operator.sh             # Single operator run (Claude Code)
 ├── mac/
-│   ├── stream_gapless.py       # Main streamer (talk-first with AI bumpers)
-│   ├── api_server.py           # Now-playing API (daemon thread in streamer)
+│   ├── feeder.py               # Playlist feeder (manages ezstream + API)
+│   ├── radio.xml               # ezstream config (Icecast, Ogg encoding)
+│   ├── next_track.py           # Track selector (schedule-aware)
+│   ├── api_server.py           # Now-playing API (daemon thread in feeder)
 │   ├── schedule.py             # Schedule parser and resolver
 │   ├── play_history.py         # Track history and dedup
 │   ├── music_gen_client.py     # REST client for music-gen.server
-│   ├── discogs_lookup.py       # Album art lookup
-│   ├── qr_generator.py         # QR code generation for now-playing
 │   ├── operator_prompt.md      # Operator maintenance prompt
 │   ├── operator_daemon.sh      # Operator loop (runs run_operator.sh)
 │   ├── listener_daemon.sh      # Listener message polling daemon
 │   ├── start_music_gen.sh      # Start music-gen + daemons in tmux
 │   ├── kokoro/                 # Kokoro TTS wrapper
-│   ├── voice_reference/        # Voice samples
 │   ├── content_generator/
 │   │   ├── talk_generator.py              # Talk segment generator
 │   │   ├── music_bumper_generator.py      # AI music bumper generator
@@ -213,12 +212,12 @@ The listener daemon polls for new messages every 30 seconds and generates spoken
 │   │   ├── music_pools_expanded.py        # Music generation prompts
 │   │   ├── persona.py                     # Host definitions and station identity
 │   │   └── helpers.py                     # Shared utilities
-│   └── config.yaml             # Local streamer config
+│   └── config.yaml             # Local config
 ├── config/
 │   ├── schedule.yaml           # Weekly show schedule
 │   └── icecast.xml.example     # Icecast template
 ├── output/
-│   ├── talk_segments/{show}/   # Generated talk audio (consumed after play)
+│   ├── talk_segments/{show}/   # Generated talk audio
 │   ├── music_bumpers/{show}/   # AI-generated music bumpers
 │   └── scripts/                # Script metadata
 └── docs/                       # Web-facing pages
@@ -227,7 +226,7 @@ The listener daemon polls for new messages every 30 seconds and generates spoken
 ## Requirements
 
 - Python 3.11+
-- ffmpeg
+- ffmpeg, ezstream, vorbis-tools
 - Icecast2
 - Claude CLI (for script generation and operator loop)
 - Kokoro TTS (~200MB model)

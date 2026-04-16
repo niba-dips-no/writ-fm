@@ -17,19 +17,22 @@ Run from the project root directory (where this file lives in `mac/`).
 
 ### 1. Health Check
 ```bash
-# Check if streamer is running
-pgrep -af stream_gapless || echo "STREAMER DOWN"
+# Check if ezstream is running
+pgrep -af "ezstream.*radio.xml" || echo "STREAMER DOWN"
+
+# Check if feeder is running
+pgrep -af "feeder.py" || echo "FEEDER DOWN"
 
 # Check Icecast
 lsof -i :8000 | grep icecast || echo "ICECAST DOWN"
 
-# Check ffmpeg encoder connected
-lsof -i :8000 | grep ffmpeg || echo "ENCODER DOWN"
+# Check Icecast has a source
+curl -sf http://localhost:8000/status-json.xsl | python3 -c "import sys,json; s=json.load(sys.stdin).get('icestats',{}).get('source',{}); print('SOURCE OK' if s else 'NO SOURCE')"
 ```
 
 If any component is down:
 - Icecast: `pkill icecast; icecast -c /opt/homebrew/etc/icecast.xml -b`
-- Streamer: `pkill -f stream_gapless; tmux send-keys -t writ "uv run python mac/stream_gapless.py" Enter`
+- Streamer+feeder: `pkill -f ezstream; pkill -f feeder; tmux send-keys -t writ:stream "uv run python mac/feeder.py --start-ezstream" Enter`
 - music-gen.server: `bash mac/start_music_gen.sh server`
 - Operator daemon: `bash mac/start_music_gen.sh operator`
 - Both at once: `bash mac/start_music_gen.sh`
@@ -53,12 +56,11 @@ cd mac/content_generator && uv run python music_bumper_generator.py --status
 ```
 
 If any show has fewer than 5 bumpers **and music-gen.server is running at localhost:4009**, generate more.
-Decide counts dynamically. Prioritize:
-1. current show
-2. next upcoming shows
-3. any show below minimum
 
-Generate only what is needed:
+**Only run ONE bumper generator at a time.** The music-gen server is a single GPU
+process — parallel requests will queue or crash it.
+
+Generate for all low shows at once:
 ```bash
 cd mac/content_generator && uv run python music_bumper_generator.py --all --min 5
 ```
@@ -77,24 +79,31 @@ cd mac/content_generator && uv run python talk_generator.py --status
 ```
 
 If any show has fewer than 6 segments, generate more.
-Decide counts dynamically. Prioritize:
-1. current show
-2. next upcoming shows
-3. any show below minimum
 
-Generate only what is needed:
+**CRITICAL: Only run ONE talk_generator command at a time. NEVER run multiple
+generators in parallel — each one loads a ~2.7 GB TTS model, and parallel runs
+will exhaust RAM (96 GB system).** Always wait for one command to finish before
+starting the next. Use `--all` (which is internally sequential) or chain
+`--show` commands with `&&`.
+
+Generate for all low shows at once (sequential internally):
+```bash
+cd mac/content_generator && uv run python talk_generator.py --all --min 6
+```
+
+Or for a specific show:
 ```bash
 cd mac/content_generator && uv run python talk_generator.py --show [SHOW_ID] --count 3
 ```
 
-Or generate for all shows:
+If multiple shows need content, chain them sequentially:
 ```bash
-cd mac/content_generator && uv run python talk_generator.py --all --count 2
+cd mac/content_generator && uv run python talk_generator.py --show show_a --count 3 && uv run python talk_generator.py --show show_b --count 3
 ```
 
 The generator uses:
 - `claude -p` for script generation (long-form talk content)
-- Kokoro TTS with show-appropriate voices
+- Kokoro TTS with show-appropriate voices (~2.7 GB per process)
 - Schedule-aware prompts based on host persona and show context
 
 ### 5. Process Listener Messages
@@ -109,13 +118,13 @@ Do not hand-edit the JSON unless you are repairing a broken file.
 
 ### 6. Review Streamer Status
 ```bash
-tmux capture-pane -t writ -p | tail -20
+tmux capture-pane -t writ:stream -p | tail -20
 ```
 Check for:
-- Pipe failures or encoder restarts
+- ezstream errors or disconnects
 - Current show and host displayed correctly
 - Talk segments playing with music bumpers between them
-- `No talk segments for ...` messages (means the current show needs more content)
+- `No content for ...` messages (means the current show needs more content)
 
 ### 7. Drift Detection
 Before you finish, check for drift between declared behavior and actual behavior.
@@ -162,7 +171,8 @@ cd mac/content_generator && uv run python talk_generator.py --status 2>/dev/null
 ```
 
 ## Key Files
-- `mac/stream_gapless.py` - Main streamer (talk-first with AI music bumpers)
+- `mac/feeder.py` - Playlist feeder (manages ezstream, builds playlists, runs API)
+- `mac/radio.xml` - ezstream configuration (Icecast connection, Ogg encoding)
 - `mac/schedule.py` - Schedule parser and resolver
 - `config/schedule.yaml` - Weekly show schedule (8 talk shows)
 - `mac/content_generator/talk_generator.py` - Talk segment generator (Claude + Kokoro)
@@ -218,6 +228,7 @@ Short-form (transitions):
 - Keep each show stocked with at least 6 talk segments
 - Keep each show stocked with at least 5 AI music bumpers
 - Prefer the smallest generation action that restores healthy stock
+- **NEVER run generators in parallel — always sequential, one at a time**
 - music-gen.server runs separately — start it before generating bumpers
 - You are allowed to decide which show to stock and how many assets to generate based on live status instead of following a rigid daemon policy
 - Drift detection is part of normal operation, not a special case
