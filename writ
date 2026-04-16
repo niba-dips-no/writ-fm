@@ -39,7 +39,7 @@ declare -A COMP_HEALTH_URL=(
     [music-gen]="http://localhost:4009/health" [operator]="" [listener]=""
 )
 declare -A COMP_PGREP=(
-    [icecast]="icecast" [stream]="stream_gapless"
+    [icecast]="icecast" [stream]="ezstream.*radio.xml"
     [tunnel]="cloudflared.*wvoid" [music-gen]="music.gen"
     [operator]="operator_daemon" [listener]="listener_daemon"
 )
@@ -106,7 +106,7 @@ validate_component() {
 get_start_cmd() {
     case "$1" in
         icecast)   echo "/opt/homebrew/bin/icecast -c '$PROJECT_ROOT/config/icecast.xml'" ;;
-        stream)    echo "cd '$PROJECT_ROOT' && uv run python mac/stream_gapless.py" ;;
+        stream)    echo "cd '$PROJECT_ROOT' && uv run python mac/feeder.py --start-ezstream" ;;
         tunnel)    echo "cloudflared tunnel run wvoid-radio" ;;
         music-gen)
             [[ -z "$MUSIC_GEN_DIR" || ! -d "$MUSIC_GEN_DIR" ]] && \
@@ -122,7 +122,7 @@ kill_port() {
     [[ -z "$port" ]] && return
     lsof -ti ":$port" 2>/dev/null | while read -r pid; do
         kill "$pid" 2>/dev/null && warn "killed stale process $pid on port $port"
-    done
+    done || true
     sleep 1
 }
 
@@ -177,16 +177,20 @@ stop_one() {
 # ── subcommands ──────────────────────────────────────────────
 
 cmd_start() {
-    local target="${1:-}"
+    local target="${1:-core}"
     case "$target" in
-        ""|core|all)
-            log "Starting WRIT-FM..."
+        core)
+            log "Starting WRIT-FM core..."
             start_one icecast; start_one stream; start_one tunnel
-            start_one music-gen; start_one operator; start_one listener
-            echo ""; ok "WRIT-FM up. tmux attach -t $SESSION" ;;
+            echo ""; ok "WRIT-FM core up. tmux attach -t $SESSION" ;;
         content)
             log "Starting content..."
             start_one music-gen; start_one operator; start_one listener ;;
+        all)
+            log "Starting WRIT-FM (all)..."
+            start_one icecast; start_one stream; start_one tunnel
+            start_one music-gen; start_one operator; start_one listener
+            echo ""; ok "WRIT-FM up. tmux attach -t $SESSION" ;;
         *)  validate_component "$target"; start_one "$target" ;;
     esac
 }

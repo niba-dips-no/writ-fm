@@ -195,3 +195,179 @@ def format_headlines(headlines: list[dict], max_items: int | None = None) -> str
         if title:
             lines.append(f"- [{source}] {title}")
     return "\n".join(lines)
+
+
+# =============================================================================
+# SHARED TTS RENDERING
+# =============================================================================
+
+_PROJECT_ROOT = Path(__file__).resolve().parents[2]
+_KOKORO_DIR = _PROJECT_ROOT / "mac" / "kokoro"
+_KOKORO_PYTHON = _KOKORO_DIR / ".venv" / "bin" / "python"
+
+
+def get_audio_duration(filepath: Path) -> float | None:
+    """Get audio duration in seconds via ffprobe."""
+    try:
+        result = subprocess.run(
+            ["ffprobe", "-v", "quiet", "-show_entries", "format=duration",
+             "-of", "csv=p=0", str(filepath)],
+            capture_output=True, text=True, timeout=10
+        )
+        if result.returncode == 0 and result.stdout.strip():
+            return float(result.stdout.strip())
+    except Exception:
+        pass
+    return None
+
+
+def render_kokoro(text: str, output_path: Path, voice: str = "am_michael") -> bool:
+    """Render text to speech using Kokoro TTS."""
+    if not _KOKORO_PYTHON.exists():
+        log("Kokoro venv not found")
+        return False
+
+    escaped_text = text.replace('\\', '\\\\').replace('"', '\\"').replace('\n', ' ')
+
+    tts_script = f'''
+import warnings
+warnings.filterwarnings("ignore")
+
+from kokoro import KPipeline
+import soundfile as sf
+import numpy as np
+
+pipe = KPipeline(lang_code="a", repo_id="hexgrad/Kokoro-82M")
+
+text = "{escaped_text}"
+voice = "{voice}"
+
+generator = pipe(text, voice=voice, speed=1.0)
+audio_segments = []
+for _, _, audio in generator:
+    audio_segments.append(audio)
+
+if len(audio_segments) == 1:
+    full_audio = audio_segments[0]
+else:
+    full_audio = np.concatenate(audio_segments)
+
+sf.write("{output_path}", full_audio, 24000)
+print("SUCCESS")
+'''
+
+    try:
+        result = subprocess.run(
+            [str(_KOKORO_PYTHON), "-c", tts_script],
+            capture_output=True,
+            text=True,
+            timeout=300,
+            cwd=str(_KOKORO_DIR),
+        )
+        return "SUCCESS" in result.stdout
+    except Exception as e:
+        log(f"Kokoro error: {e}")
+        return False
+
+
+def concatenate_audio(chunk_files: list[Path], output_path: Path, gap_seconds: float = 0) -> bool:
+    """Concatenate WAV files, optionally with silence gaps between them."""
+    if len(chunk_files) == 1:
+        chunk_files[0].rename(output_path)
+        return True
+
+    list_file = output_path.with_suffix('.concat.txt')
+
+    try:
+        with open(list_file, 'w') as f:
+            for cf in chunk_files:
+                f.write(f"file '{cf}'\n")
+
+        cmd = [
+            "ffmpeg", "-y", "-f", "concat", "-safe", "0",
+            "-i", str(list_file),
+            "-ar", "24000", "-ac", "1",
+            str(output_path)
+        ]
+
+        result = subprocess.run(cmd, capture_output=True, timeout=120)
+
+        list_file.unlink(missing_ok=True)
+        for cf in chunk_files:
+            cf.unlink(missing_ok=True)
+
+        if result.returncode != 0:
+            stderr = result.stderr.decode()
+            stdout = result.stdout.decode()
+            log(f"  Concat failed (rc={result.returncode}):")
+            log(f"  STDERR (last 1500): {stderr[-1500:]}")
+            if stdout.strip():
+                log(f"  STDOUT: {stdout[-500:]}")
+            return False
+
+        return output_path.exists()
+
+    except Exception as e:
+        log(f"  Concat error: {e}")
+        list_file.unlink(missing_ok=True)
+        return False
+
+
+def render_single_voice(text: str, output_path: Path, voice: str) -> bool:
+    """Render a single-voice script to audio, chunking for long content."""
+    MAX_CHUNK_WORDS = 100
+    words = text.split()
+
+    if len(words) <= MAX_CHUNK_WORDS:
+        return render_kokoro(text, output_path, voice)
+
+    sentences = re.split(r'(?<=[.!?])\s+', text)
+
+    chunks: list[str] = []
+    current_chunk: list[str] = []
+    current_words = 0
+
+    for sentence in sentences:
+        sentence_words = len(sentence.split())
+        if current_words + sentence_words > MAX_CHUNK_WORDS and current_chunk:
+            chunks.append(' '.join(current_chunk))
+            current_chunk = [sentence]
+            current_words = sentence_words
+        else:
+            current_chunk.append(sentence)
+            current_words += sentence_words
+
+    if current_chunk:
+        chunks.append(' '.join(current_chunk))
+
+    log(f"  Rendering {len(chunks)} chunks with voice {voice}...")
+
+    # Use a temp directory for chunks so the streamer doesn't consume them
+    import tempfile
+    tmp_dir = Path(tempfile.mkdtemp(prefix="writ_chunks_"))
+
+    chunk_files: list[Path] = []
+    failed_chunks = 0
+    for i, chunk in enumerate(chunks):
+        chunk_path = tmp_dir / f"chunk{i:03d}.wav"
+        for attempt in range(2):
+            if render_kokoro(chunk, chunk_path, voice):
+                chunk_files.append(chunk_path)
+                break
+            time.sleep(2)
+        else:
+            failed_chunks += 1
+
+    if failed_chunks:
+        log(f"  {failed_chunks}/{len(chunks)} chunks failed to render")
+
+    if not chunk_files:
+        log("  No chunks rendered")
+        tmp_dir.rmdir()
+        return False
+
+    result = concatenate_audio(chunk_files, output_path)
+    # Clean up temp directory
+    import shutil
+    shutil.rmtree(tmp_dir, ignore_errors=True)
+    return result

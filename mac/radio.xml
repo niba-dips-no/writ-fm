@@ -1,0 +1,65 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  WRIT-FM ezstream configuration
+  Reads from a playlist file managed by the feeder.
+  Send SIGHUP to reload the playlist after updates.
+-->
+<ezstream>
+  <servers>
+    <server>
+      <hostname>localhost</hostname>
+      <port>8000</port>
+      <password>writ_source_2024</password>
+      <tls>None</tls>
+      <reconnect_attempts>0</reconnect_attempts>
+    </server>
+  </servers>
+
+  <streams>
+    <stream>
+      <mountpoint>/stream</mountpoint>
+      <format>Ogg</format>
+      <encoder>oggenc-q4</encoder>
+      <stream_name>WRIT-FM</stream_name>
+      <stream_genre>Talk Radio</stream_genre>
+      <stream_description>The frequency between frequencies</stream_description>
+    </stream>
+  </streams>
+
+  <intakes>
+    <intake>
+      <type>playlist</type>
+      <filename>/Volumes/K3/agent-working-space/projects/active/2025-12-29-radio-station/output/.playlist.m3u</filename>
+      <shuffle>No</shuffle>
+      <stream_once>No</stream_once>
+    </intake>
+  </intakes>
+
+  <metadata>
+    <program>/Volumes/K3/agent-working-space/projects/active/2025-12-29-radio-station/mac/stream_metadata.sh</program>
+    <format_str>@a@ - @t@</format_str>
+    <normalize_strings>Yes</normalize_strings>
+    <no_updates>No</no_updates>
+  </metadata>
+
+  <decoders>
+    <decoder>
+      <name>ffmpeg-wav</name>
+      <program>ffmpeg -v quiet -i @T@ -af loudnorm=I=-14:TP=-1.5:LRA=7,aresample=44100 -f s16le -acodec pcm_s16le -ar 44100 -ac 2 -</program>
+      <file_ext>.wav</file_ext>
+    </decoder>
+    <decoder>
+      <name>ffmpeg-flac</name>
+      <program>ffmpeg -v quiet -i @T@ -af loudnorm=I=-16:TP=-1.5:LRA=11,afade=t=in:st=0:d=3,aresample=44100 -f s16le -acodec pcm_s16le -ar 44100 -ac 2 -</program>
+      <file_ext>.flac</file_ext>
+    </decoder>
+  </decoders>
+
+  <encoders>
+    <encoder>
+      <name>oggenc-q4</name>
+      <format>Ogg</format>
+      <program>oggenc -r -B 16 -C 2 -R 44100 --raw-endianness 0 -q 4 -t @M@ -</program>
+    </encoder>
+  </encoders>
+</ezstream>
