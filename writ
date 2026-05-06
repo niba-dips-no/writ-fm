@@ -110,7 +110,11 @@ validate_component() {
 
 get_start_cmd() {
     case "$1" in
-        icecast)   echo "/opt/homebrew/bin/icecast -c '$PROJECT_ROOT/config/icecast.xml'" ;;
+        icecast)
+            local icecast_bin="${ICECAST_BIN:-$(command -v icecast || true)}"
+            [[ -z "$icecast_bin" ]] && \
+                { err "icecast not found. Install icecast or set ICECAST_BIN."; return 1; }
+            echo "'$icecast_bin' -c '$PROJECT_ROOT/config/icecast.xml'" ;;
         stream)    echo "cd '$PROJECT_ROOT' && uv run python mac/feeder.py --start-ezstream" ;;
         tunnel)    echo "cloudflared tunnel run wvoid-radio" ;;
         music-gen)
