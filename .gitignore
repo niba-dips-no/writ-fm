@@ -25,6 +25,8 @@ output/.silence.wav
 output/.current_track.txt
 output/.streamer_state.json
 output/.ezstream.pid
+output/operator.lock/
+output/*.txt
 
 # Dev files
 command.txt
