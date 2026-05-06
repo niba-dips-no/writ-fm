@@ -20,14 +20,25 @@ echo "[listener-daemon $(ts)] Starting. Polling every ${POLL_INTERVAL}s"
 while true; do
     # Quick check: any unread messages?
     if [ -f "$MESSAGES_FILE" ]; then
-        UNREAD=$(python3 -c "
-import json, sys
+        UNREAD=$(cd "$RADIO_DIR" && uv run python -c '
+import json
+import sys
+from pathlib import Path
+
 try:
-    msgs = json.load(open('$MESSAGES_FILE'))
-    unread = [m for m in msgs if not m.get('read', False) and len(m.get('message','').strip()) >= 2]
-    print(len(unread))
-except: print(0)
-" 2>/dev/null)
+    msgs = json.loads(Path(sys.argv[1]).read_text())
+    unread = sum(
+        1
+        for m in msgs
+        if isinstance(m, dict)
+        and not m.get("read", False)
+        and len(str(m.get("message") or "").strip()) >= 2
+    )
+except Exception:
+    unread = 0
+
+print(unread)
+' "$MESSAGES_FILE" 2>/dev/null)
     else
         UNREAD=0
     fi
