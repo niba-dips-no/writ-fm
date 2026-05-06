@@ -44,6 +44,15 @@ def _first_text(value) -> str | None:
     return None
 
 
+def _public_url(value) -> str | None:
+    if not isinstance(value, str) or not value:
+        return None
+    if value.startswith(("http://", "https://")):
+        return value
+    path = value if value.startswith("/") else f"/{value}"
+    return f"https://www.discogs.com{path}"
+
+
 def search_discogs(track_name: str, vibe: str | None = None) -> DiscogsResult | None:
     """Search Discogs for the best release match for a track display name."""
     if not HAS_CREDENTIALS or not track_name:
@@ -68,7 +77,7 @@ def search_discogs(track_name: str, vibe: str | None = None) -> DiscogsResult | 
         title=title,
         artist=artist,
         year=item.get("year"),
-        url=item.get("uri"),
+        url=_public_url(item.get("uri")),
         thumb_url=item.get("thumb"),
         label=_first_text(item.get("label")),
         format=_first_text(item.get("format")),
