@@ -153,6 +153,10 @@ start_one() {
     fi
 }
 
+start_music_gen_optional() {
+    start_one music-gen || warn "music-gen skipped; continuing with content daemons"
+}
+
 stop_one() {
     local comp="$1" pat="${COMP_PGREP[$1]}" port="${COMP_PORT[$1]}"
 
@@ -185,11 +189,11 @@ cmd_start() {
             echo ""; ok "WRIT-FM core up. tmux attach -t $SESSION" ;;
         content)
             log "Starting content..."
-            start_one music-gen; start_one operator; start_one listener ;;
+            start_music_gen_optional; start_one operator; start_one listener ;;
         all)
             log "Starting WRIT-FM (all)..."
             start_one icecast; start_one stream; start_one tunnel
-            start_one music-gen; start_one operator; start_one listener
+            start_music_gen_optional; start_one operator; start_one listener
             echo ""; ok "WRIT-FM up. tmux attach -t $SESSION" ;;
         *)  validate_component "$target"; start_one "$target" ;;
     esac
