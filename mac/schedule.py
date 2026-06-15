@@ -15,7 +15,8 @@ The streamer can use this to:
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timedelta
+import os
 from pathlib import Path
 import re
 from typing import Any
@@ -115,8 +116,11 @@ class Show:
     topic_focus: str = ""
     segment_types: list[str] = field(default_factory=lambda: ["deep_dive"])
     bumper_style: str = "ambient"
-    voices: dict[str, str] = field(default_factory=dict)
-    # Legacy fields (optional, unused in talk-first mode)
+    # voices maps speaker key ("host", "guest", ...) to either:
+    #   - a single voice id string (legacy; treated as Kokoro voice)
+    #   - a per-engine dict: {"kokoro": "af_bella", "chatterbox": "./sample.wav", "voxtral": "casual_male"}
+    voices: dict[str, str | dict[str, str]] = field(default_factory=dict)
+    # Legacy fields (optional, unused in the current music-forward mode)
     segment_after_tracks: int = 1
     podcasts_enabled: bool = False
     music: dict[str, Any] = field(default_factory=dict)
@@ -162,7 +166,7 @@ class ResolvedShow:
     topic_focus: str
     segment_types: list[str]
     bumper_style: str
-    voices: dict[str, str]
+    voices: dict[str, str | dict[str, str]]
     # Legacy (kept for backward compat)
     segment_after_tracks: int = 1
     podcasts_enabled: bool = False
@@ -219,38 +223,94 @@ class StationSchedule:
                         f"Valid: {sorted(VALID_SEGMENT_TYPES)}"
                     )
 
-    def resolve(self, now: datetime | None = None) -> ResolvedShow:
-        now = now or datetime.now()
-
+    def _matching_block(self, now: datetime) -> ScheduleBlock:
         for block in self.overrides:
             if block.matches(now):
-                show = self.shows[block.show_id]
-                return ResolvedShow(
-                    show_id=show.show_id,
-                    name=show.name,
-                    description=show.description,
-                    host=show.host,
-                    topic_focus=show.topic_focus,
-                    segment_types=list(show.segment_types),
-                    bumper_style=show.bumper_style,
-                    voices=dict(show.voices),
-                )
-
+                return block
         for block in self.base:
             if block.matches(now):
-                show = self.shows[block.show_id]
-                return ResolvedShow(
-                    show_id=show.show_id,
-                    name=show.name,
-                    description=show.description,
-                    host=show.host,
-                    topic_focus=show.topic_focus,
-                    segment_types=list(show.segment_types),
-                    bumper_style=show.bumper_style,
-                    voices=dict(show.voices),
-                )
-
+                return block
         raise ScheduleError("No matching schedule block for current time (base clock may be invalid)")
+
+    def resolve(self, now: datetime | None = None) -> ResolvedShow:
+        now = now or datetime.now()
+        block = self._matching_block(now)
+        show = self.shows[block.show_id]
+        return ResolvedShow(
+            show_id=show.show_id,
+            name=show.name,
+            description=show.description,
+            host=show.host,
+            topic_focus=show.topic_focus,
+            segment_types=list(show.segment_types),
+            bumper_style=show.bumper_style,
+            voices=dict(show.voices),
+        )
+
+    def airing_start(self, now: datetime | None = None) -> datetime:
+        """Return the datetime when the currently-matching block began airing."""
+        now = now or datetime.now()
+        block = self._matching_block(now)
+        start_h, start_m = divmod(block.start_minute, 60)
+        minute = now.hour * 60 + now.minute
+
+        # Non-cross-midnight block: airing started today at start time
+        if block.end_minute > block.start_minute:
+            return now.replace(hour=start_h, minute=start_m, second=0, microsecond=0)
+
+        # Cross-midnight block
+        if minute >= block.start_minute:
+            # We're in the start-day portion
+            return now.replace(hour=start_h, minute=start_m, second=0, microsecond=0)
+        # We're past midnight, in the continuation portion
+        yesterday = now - timedelta(days=1)
+        return yesterday.replace(hour=start_h, minute=start_m, second=0, microsecond=0)
+
+    def next_airings(
+        self,
+        now: datetime | None = None,
+        count: int = 4,
+        horizon_hours: int = 48,
+    ) -> list[tuple[str, datetime]]:
+        """Return the next `count` airings as (show_id, start_datetime).
+
+        The currently-active airing is the first entry. Walks forward in
+        5-minute steps, recording each time (show_id, airing_start) changes.
+        """
+        now = now or datetime.now()
+        airings: list[tuple[str, datetime]] = []
+        last_key: tuple[str, datetime] | None = None
+        t = now
+        end = now + timedelta(hours=horizon_hours)
+        step = timedelta(minutes=5)
+        while t <= end and len(airings) < count:
+            try:
+                resolved = self.resolve(t)
+                start_dt = self.airing_start(t)
+            except ScheduleError:
+                t += step
+                continue
+            key = (resolved.show_id, start_dt)
+            if key != last_key:
+                airings.append(key)
+                last_key = key
+            t += step
+        return airings
+
+
+def slot_key(airing_start: datetime) -> str:
+    """Canonical slot folder name for an airing."""
+    return airing_start.strftime("%Y-%m-%d_%H%M")
+
+
+SLOT_RE = re.compile(r"^\d{4}-\d{2}-\d{2}_\d{4}$")
+
+
+def parse_slot_key(key: str) -> datetime:
+    """Inverse of slot_key; raises ValueError if malformed."""
+    if not SLOT_RE.match(key):
+        raise ValueError(f"Not a slot key: {key!r}")
+    return datetime.strptime(key, "%Y-%m-%d_%H%M")
 
 
 def load_schedule(path: Path) -> StationSchedule:
@@ -288,8 +348,15 @@ def load_schedule(path: Path) -> StationSchedule:
         segment_types = [str(s).strip() for s in segment_types_raw]
         bumper_style = str(cfg.get("bumper_style", "ambient")).strip()
 
-        # Voice config
-        voices = cfg.get("voices") if isinstance(cfg.get("voices"), dict) else {}
+        # Voice config: accept either a flat string per speaker (legacy Kokoro voice)
+        # or a per-engine dict {"kokoro": ..., "chatterbox": ..., "voxtral": ...}.
+        voices_raw = cfg.get("voices") if isinstance(cfg.get("voices"), dict) else {}
+        voices: dict[str, str | dict[str, str]] = {}
+        for speaker_key, value in voices_raw.items():
+            if isinstance(value, dict):
+                voices[str(speaker_key)] = {str(k): str(v) for k, v in value.items()}
+            else:
+                voices[str(speaker_key)] = str(value)
 
         # Legacy fields (optional)
         segment_after_tracks = int(cfg.get("segment_after_tracks", 1))
@@ -304,7 +371,7 @@ def load_schedule(path: Path) -> StationSchedule:
             topic_focus=topic_focus,
             segment_types=segment_types,
             bumper_style=bumper_style,
-            voices={str(k): str(v) for k, v in voices.items()},
+            voices=voices,
             segment_after_tracks=segment_after_tracks,
             podcasts_enabled=podcasts_enabled,
             music=dict(music) if music else {},
@@ -367,7 +434,10 @@ def _cli() -> int:
     parser = argparse.ArgumentParser(description="WRIT-FM schedule tools")
     parser.add_argument(
         "--schedule",
-        default=str(Path(__file__).resolve().parents[1] / "config" / "schedule.yaml"),
+        default=os.environ.get(
+            "WRIT_SCHEDULE_PATH",
+            str(Path(__file__).resolve().parents[1] / "config" / "schedule.yaml"),
+        ),
         help="Path to schedule.yaml",
     )
     sub = parser.add_subparsers(dest="cmd", required=True)

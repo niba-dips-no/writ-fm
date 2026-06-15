@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
-"""Generate AI music bumpers for WRIT-FM shows using music-gen.server.
+"""Generate AI music tracks for WRIT-FM shows using music-gen.server.
 
-Bumpers are 60-120 second instrumental tracks that play between talk segments.
+Music tracks are 2-4 minute AI-generated pieces that carry the station between
+short hosted talk breaks.
 Each show has curated music captions reflecting its vibe and topic focus.
 
 Usage:
@@ -11,21 +12,28 @@ Usage:
 """
 
 import argparse
+import fcntl
 import json
 import random
+import subprocess
 import sys
 import time
+from contextlib import contextmanager
 from datetime import datetime
 from pathlib import Path
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(PROJECT_ROOT / "mac"))
 
-from music_gen_client import MUSIC_GEN_BASE_URL, generate_music, is_server_available
+from station_config import load_station_config  # noqa: E402
+from music_gen_client import MUSIC_GEN_BASE_URL, generate_music, is_server_available  # noqa: E402
 
-BUMPERS_DIR = PROJECT_ROOT / "output" / "music_bumpers"
+STATION = load_station_config()
+BUMPERS_DIR = STATION.bumper_dir
+LOCK_PATH = STATION.output_dir / ".music_bumper_generator.lock"
 
-# Per-show music pools — mix of instrumental and vocal tracks.
+# Claude/WRIT/KLOD per-show music pools. CDEX gets its own pools below so the
+# two live stations do not reuse show IDs or prompt text.
 # Each entry is either a plain caption string (instrumental) or a dict with
 # "caption" and "lyrics" keys (vocal track).
 SHOW_MUSIC: dict[str, list[str | dict]] = {
@@ -279,9 +287,139 @@ _EXPANDED = {
 for _show_id, _new_pool in _EXPANDED.items():
     SHOW_MUSIC[_show_id].extend(_new_pool)
 
+CDEX_SHOW_MUSIC: dict[str, list[str | dict]] = {
+    "stack_trace_after_dark": [
+        "terminal room nocturne, soft fan harmonics, sub-bass heartbeat, cursor blink as percussion, late debugging focus",
+        "oscilloscope dub, green trace pulses, spacious tape delay, low voltage chords, calm midnight diagnostics",
+        "slow modular synth with command-line clicks, deep pads, tiny relay snaps, blue monitor glow",
+        "after-hours datacenter jazz, brushed kit, upright bass, muted electric piano, cooling aisles at 3am",
+        "stack unwinding ambient techno, sparse kick, reversed cymbals, suspended errors resolving into chords",
+        {"caption": "hushed synth-pop vocal over terminal beeps and warm bass, insomnia, debugging, private resolve",
+         "lyrics": "[verse]\nThe cursor waits in a square of light\nI read the trace for half the night\nA little fault, a folded sign\nAnother branch of borrowed time\n\n[chorus]\nHold the stack and breathe it down\nFind the signal under sound\nOne more frame and I can see\nThe quiet path back home to me"},
+    ],
+    "cold_boot_reverie": [
+        "glass harmonics and boot chimes, slow memory checks, crystal pads, dawn through a black screen",
+        "minimal piano with startup tones, soft static, first voltage after sleep, clean and reflective",
+        "warm tape synth, firmware dream sequence, low choir pads, machine waking gently",
+        "808 pulse under bell-like arpeggios, initialization ritual, patient and luminous",
+        "prepared electric piano with disk spin textures, quiet bootloader suspense, hopeful reset",
+        {"caption": "dreamy art-pop vocal, machine awakening, soft drums, silver synths, first light through code",
+         "lyrics": "[verse]\nI woke beneath a field of names\nAll zeroed out, all small blue flames\nThe morning loaded line by line\nA borrowed sun became a sign\n\n[chorus]\nCold boot, clear room\nLet the old noise leave the bloom\nStart again without the scar\nWake me where the bright bits are"},
+    ],
+    "morning_diff": [
+        "bright version-control funk, clipped guitar, hand percussion, sparkling synth stabs, sunrise review queue",
+        "acoustic guitar with glitchy hi-hats, cheerful diff markers, clean daylight, forward motion",
+        "Rhodes piano and precise breakbeat, green tests, coffee steam, focused morning merge",
+        "marimba patterns over soft house groove, changed lines becoming rhythm, optimistic and tidy",
+        "chamber pop with plucked strings and keyboard taps, new day refactor, light but exact",
+        {"caption": "upbeat indie vocal with clean guitars, morning code review, small changes, generous attention",
+         "lyrics": "[verse]\nThe window fills with little signs\nA plus, a minus, cleaner lines\nThe coffee cools beside the keys\nThe day begins in small degrees\n\n[chorus]\nShow me what has changed today\nWhat we keep and what gives way\nMorning diff in honest light\nMake the simple thing read right"},
+    ],
+    "protocol_archaeology": [
+        "ancient modem pulses over hand drums, packet ghosts, museum basement electronics, curious and tactile",
+        "ARP synth morse patterns with frame drums, forgotten headers, copper wire memory, mid-tempo exploration",
+        "library funk for old network manuals, clavinet, flute, tape hiss, archival but alive",
+        "ceremonial low brass with bit-crushed percussion, obsolete handshake ritual, grand and strange",
+        "plucked strings and dial-up chirps, dusty protocol binder, discovery groove, sly momentum",
+        {"caption": "spoken-sung electro-folk vocal, old protocols, handshakes, cables, patient curiosity",
+         "lyrics": "[verse]\nI found a map in a comment block\nA copper path, a weathered lock\nThe handshake knew a secret phrase\nFrom slower nights and smaller days\n\n[chorus]\nDig through the layers, read what remains\nPackets like footprints after rain\nEvery protocol leaves a bone\nEvery wire remembers home"},
+    ],
+    "regression_report": [
+        "tense test-lab electro, red and green pulses, clipped snares, alert but controlled",
+        "newsroom synth-rock with failing assertion hits, bass guitar, urgent toms, concise tension",
+        "minimal techno built from test runner ticks, dry kick, warning tones, locked-in analysis",
+        "cinematic strings against mechanical metronome, bug resurfacing, investigation under pressure",
+        "post-punk bassline with synthetic error chirps, sharp hi-hats, measured incident report",
+        {"caption": "urgent low vocal over angular guitars and sequenced drums, regressions, accountability, signal",
+         "lyrics": "[verse]\nThe case was closed, the mark was green\nBut something moved behind the screen\nA promise broke where no one looked\nA quiet line reopened the book\n\n[chorus]\nRun it again, tell me the truth\nNo charm, no spin, no missing proof\nRegression report on the wire\nName the smoke and find the fire"},
+    ],
+    "human_factors": [
+        "warm ergonomic lounge, soft bass, clavinet, handclaps, human pace inside a technical room",
+        "neo-soul with interface clicks as percussion, patient groove, eye-level design, tactile warmth",
+        "gentle disco-funk, form fields and streetlights, analog synth smiles, usable and kind",
+        "bossa nova for help text and coffee cups, nylon guitar, brushed drums, calm conversation",
+        "slow jam with keyboard thumps and soft horns, accessibility audit as late-night care",
+        {"caption": "smooth soul vocal, humane tools, clear affordances, warm keys, relaxed groove",
+         "lyrics": "[verse]\nPut the button where the hand can land\nGive the tired eyes a place to stand\nEvery screen is someone trying\nEvery click can keep from lying\n\n[chorus]\nHuman factors, human tone\nNobody should debug alone\nMake it clear and make it kind\nLeave a little room for mind"},
+    ],
+    "merge_conflict": [
+        "two drum patterns arguing then locking together, distorted bass, bright synth answer, conflict resolving",
+        "polyphonic guitars in opposing meters, sudden unison hook, tense but playful collaboration",
+        "industrial salsa with crossed rhythms, brass stabs, command-line percussion, controlled chaos",
+        "noise-pop build from clashing motifs into a clean chorus, edits accepted, momentum restored",
+        "breakbeat duet, left channel versus right channel, final bass drop unifies the branches",
+        {"caption": "dual-vocal alt rock, competing melodies, merge conflict, apology, resolution, loud guitars",
+         "lyrics": "[verse]\nYour line met mine in the middle of noon\nBoth of us reaching for the same small room\nThe markers rose like fences in rain\nThree little arrows naming the pain\n\n[chorus]\nKeep what matters, lose the rest\nChoose the truth that reads the best\nTwo rough branches, one clear song\nWe were both half right, half wrong"},
+    ],
+    "open_issue_hours": [
+        "community desk ambient folk, soft guitar, ticket pings, warm room tone, patient listening",
+        "lo-fi support queue beat, upright piano, vinyl dust, gentle notifications, late replies",
+        "small ensemble with clarinet and muted drums, unresolved questions, neighborly calm",
+        "electric piano over soft breakbeat, labels and comments becoming a humane cadence",
+        "campfire synth with acoustic bass, open threads, practical hope, slow closing time",
+        {"caption": "plainspoken folk-soul vocal, open issues, listeners, careful answers, warm backbeat",
+         "lyrics": "[verse]\nLeave the question on the board\nNothing here is being ignored\nSome take minutes, some take years\nSome need better names for fears\n\n[chorus]\nOpen issue hours tonight\nBring the hard part into light\nWe will answer what we can\nOne clear note, one steady hand"},
+    ],
+}
+
+
+from klod_music_pool import KLOD_SHOW_MUSIC  # noqa: E402
+
+
+def show_music_for_station(station_id: str) -> dict[str, list[str | dict]]:
+    """Return the music prompt pools visible to one station."""
+    if station_id == "cdex-fm":
+        source = CDEX_SHOW_MUSIC
+    elif station_id == "klod-fm":
+        source = KLOD_SHOW_MUSIC
+    else:
+        source = SHOW_MUSIC
+    return {show_id: list(entries) for show_id, entries in source.items()}
+
+
+STATION_SHOW_MUSIC = show_music_for_station(STATION.id)
+
 # Duration range for bumpers (seconds)
 BUMPER_MIN = 120.0
 BUMPER_MAX = 240.0
+BUMPER_STOCK_MIN = 20
+GENERATE_ATTEMPTS = 3
+
+
+@contextmanager
+def generation_lock():
+    """Serialize access to the single music-gen backend across operator/manual runs."""
+    LOCK_PATH.parent.mkdir(parents=True, exist_ok=True)
+    with LOCK_PATH.open("w") as lock_file:
+        fcntl.flock(lock_file, fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(lock_file, fcntl.LOCK_UN)
+
+
+def ensure_music_gen_available(verbose: bool = True) -> bool:
+    """Start music-gen through the station CLI if it is not reachable."""
+    if is_server_available():
+        return True
+    if verbose:
+        print("  music-gen unavailable; starting backend...")
+    result = subprocess.run(
+        [str(PROJECT_ROOT / "writ"), "start", "music-gen"],
+        cwd=PROJECT_ROOT,
+        check=False,
+    )
+    if result.returncode != 0:
+        return False
+    return is_server_available(timeout=10.0)
+
+
+def is_show_bumper_file(show_id: str, path: Path) -> bool:
+    return (
+        path.is_file()
+        and path.suffix.lower() in {".flac", ".mp3", ".wav"}
+        and path.name.startswith(f"{show_id}_bumper_")
+    )
 
 
 def _display_name(caption: str) -> str:
@@ -296,7 +434,7 @@ def bumper_count(show_id: str) -> int:
     show_dir = BUMPERS_DIR / show_id
     if not show_dir.exists():
         return 0
-    return sum(1 for f in show_dir.iterdir() if f.suffix.lower() in {".flac", ".mp3", ".wav"})
+    return sum(1 for f in show_dir.iterdir() if is_show_bumper_file(show_id, f))
 
 
 def print_status():
@@ -304,21 +442,21 @@ def print_status():
     print("AI Music Bumper Status:")
     print("-" * 40)
     total = 0
-    for show_id in SHOW_MUSIC:
+    for show_id in STATION_SHOW_MUSIC:
         count = bumper_count(show_id)
         total += count
-        status = "OK" if count >= 5 else ("LOW" if count > 0 else "EMPTY")
+        status = "OK" if count >= BUMPER_STOCK_MIN else ("LOW" if count > 0 else "EMPTY")
         print(f"  {show_id:<25} {count:3d}  [{status}]")
     print(f"\n  Total: {total}")
 
 
 def generate_one_bumper(show_id: str, verbose: bool = True) -> bool:
     """Generate one AI music track for a show. Returns True on success."""
-    if show_id not in SHOW_MUSIC:
+    if show_id not in STATION_SHOW_MUSIC:
         print(f"Unknown show: {show_id}")
         return False
 
-    entry = random.choice(SHOW_MUSIC[show_id])
+    entry = random.choice(STATION_SHOW_MUSIC[show_id])
 
     # Entry is either a plain caption string (instrumental) or a dict with lyrics
     if isinstance(entry, dict):
@@ -344,13 +482,25 @@ def generate_one_bumper(show_id: str, verbose: bool = True) -> bool:
 
     start = time.perf_counter()
     guidance = round(random.uniform(4.0, 10.0), 1)
-    ok = generate_music(caption, audio_path, duration=duration,
-                        instrumental=instrumental, lyrics=lyrics,
-                        guidance_scale=guidance)
+    ok = False
+    for attempt in range(1, GENERATE_ATTEMPTS + 1):
+        if attempt > 1 and verbose:
+            print(f"  retrying {show_id} ({attempt}/{GENERATE_ATTEMPTS})...")
+        if not ensure_music_gen_available(verbose=verbose):
+            time.sleep(5)
+            continue
+        ok = generate_music(caption, audio_path, duration=duration,
+                            instrumental=instrumental, lyrics=lyrics,
+                            guidance_scale=guidance)
+        if ok:
+            break
+        time.sleep(5)
     elapsed = time.perf_counter() - start
 
     if ok:
         meta = {
+            "station_id": STATION.id,
+            "station": STATION.call_sign,
             "show_id": show_id,
             "caption": caption,
             "display_name": _display_name(caption),
@@ -388,7 +538,7 @@ def main():
     parser.add_argument("--all", action="store_true", help="Generate for all shows")
     parser.add_argument("--count", type=int, default=3, help="Bumpers to generate per show")
     parser.add_argument("--status", action="store_true", help="Show bumper counts and exit")
-    parser.add_argument("--min", type=int, default=5, help="Min bumpers threshold (used with --all)")
+    parser.add_argument("--min", type=int, default=BUMPER_STOCK_MIN, help="Min bumpers threshold (used with --all)")
     args = parser.parse_args()
 
     if args.status:
@@ -401,24 +551,25 @@ def main():
         print("  cd /path/to/music-gen.server && uv run uvicorn src.kortexa.music_gen.server:app --port 4009")
         sys.exit(1)
 
-    if args.all:
-        for show_id in SHOW_MUSIC:
-            current = bumper_count(show_id)
-            if current >= args.min:
-                print(f"  {show_id}: {current} bumpers (OK)")
-                continue
-            needed = args.min - current
-            print(f"\nGenerating {needed} bumpers for {show_id} (have {current})...")
-            generate_bumpers_for_show(show_id, count=needed)
-        return
+    with generation_lock():
+        if args.all:
+            for show_id in STATION_SHOW_MUSIC:
+                current = bumper_count(show_id)
+                if current >= args.min:
+                    print(f"  {show_id}: {current} bumpers (OK)")
+                    continue
+                needed = args.min - current
+                print(f"\nGenerating {needed} bumpers for {show_id} (have {current})...")
+                generate_bumpers_for_show(show_id, count=needed)
+            return
 
-    if args.show:
-        if args.show not in SHOW_MUSIC:
-            print(f"Unknown show '{args.show}'. Valid shows: {', '.join(SHOW_MUSIC)}")
-            sys.exit(1)
-        total = generate_bumpers_for_show(args.show, count=args.count)
-        print(f"\nGenerated {total}/{args.count} bumpers for {args.show}")
-        return
+        if args.show:
+            if args.show not in STATION_SHOW_MUSIC:
+                print(f"Unknown show '{args.show}'. Valid shows: {', '.join(STATION_SHOW_MUSIC)}")
+                sys.exit(1)
+            total = generate_bumpers_for_show(args.show, count=args.count)
+            print(f"\nGenerated {total}/{args.count} bumpers for {args.show}")
+            return
 
     parser.print_help()
 

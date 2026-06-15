@@ -7,16 +7,32 @@ __pycache__/
 # Chatterbox venv (separate from main)
 mac/chatterbox/.venv/
 
+# Voxtral venv (separate from main)
+mac/voxtral/.venv/
+
 # Output files (generated content — never commit)
 output/segments/
+output/tts-test/
 output/talk_segments/
 output/music_bumpers/
 output/scripts/
 output/chopped_music/
 output/music/
 output/podcasts/
+output/archive/
+output/show_logs/
+output/operator_intents/
+output/runtime/
+output/stations/
 output/now_playing.json
 output/generation.log
+output/.playlist.m3u
+output/.silence.wav
+output/.current_track.txt
+output/.streamer_state.json
+output/.ezstream.pid
+output/operator.lock/
+output/*.txt
 
 # Dev files
 command.txt

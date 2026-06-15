@@ -2,41 +2,40 @@
 """
 WRIT-FM Talk Segment Generator
 
-Generates long-form talk show content for the talk-first radio format.
+Generates hosted talk breaks for the music-forward radio format.
 Uses Claude CLI for scripts and Kokoro TTS for rendering.
 
 Segment types:
-  Long-form (primary content, 1500-3000 words):
-    deep_dive       - Extended single-topic exploration
+  Hosted breaks (primary spoken content, 450-1000 words):
+    deep_dive       - Compact single-topic exploration
     news_analysis   - Current events through late-night lens (uses RSS headlines)
-    interview       - Simulated interview with historical/fictional figure
-    panel           - Two hosts discuss topic from different angles
-    story           - Narrative storytelling, true stories from music/culture
+    interview       - Short simulated interview with historical/fictional figure
+    panel           - Two hosts discuss one topic from different angles
+    story           - Narrative storytelling from music/culture
     listener_mailbag - Invented listener letters + responses
-    music_essay     - Extended essay on artist/album/genre
+    music_essay     - Focused essay on artist/album/genre
 
   Short-form (transitions):
     station_id      - 15-30 word station identification
-    show_intro      - 80-150 word show opening
-    show_outro      - 60-120 word show closing
+    show_intro      - 40-80 word show opening
+    show_outro      - 35-70 word show closing
 
 Usage:
     uv run python talk_generator.py                                # Current show
-    uv run python talk_generator.py --show midnight_signal --count 5
+    uv run python talk_generator.py --show midnight_signal --count 2
     uv run python talk_generator.py --type deep_dive --topic "why vinyl matters"
-    uv run python talk_generator.py --all --count 3                # 3 per show
+    uv run python talk_generator.py --all --count 2                # 2 per show
 """
 
 from __future__ import annotations
 
 import argparse
+import fcntl
 import json
-import os
 import random
-import subprocess
 import sys
 import time
-from dataclasses import dataclass
+from contextlib import contextmanager
 from datetime import datetime
 from pathlib import Path
 
@@ -44,45 +43,53 @@ sys.path.insert(0, str(Path(__file__).parent))
 
 from helpers import (
     log, preprocess_for_tts, fetch_headlines, format_headlines, run_claude,
-    render_kokoro, render_single_voice, concatenate_audio, get_audio_duration,
+    render_speech, render_single_voice, concatenate_audio, get_audio_duration,
 )
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
-SCHEDULE_PATH = PROJECT_ROOT / "config" / "schedule.yaml"
-OUTPUT_DIR = PROJECT_ROOT / "output" / "talk_segments"
-SCRIPTS_DIR = PROJECT_ROOT / "output" / "scripts"
-
 sys.path.insert(0, str(PROJECT_ROOT / "mac"))
-from schedule import load_schedule, StationSchedule
+from station_config import load_station_config  # noqa: E402
+from schedule import load_schedule, StationSchedule, slot_key, parse_slot_key  # noqa: E402
+
+STATION = load_station_config()
+SCHEDULE_PATH = STATION.schedule_path
+OUTPUT_DIR = STATION.talk_dir
+SCRIPTS_DIR = STATION.scripts_dir
+SHOW_LOG_DIR = STATION.show_log_dir
+MESSAGES_FILE = STATION.messages_file
+LOCK_PATH = PROJECT_ROOT / "output" / ".talk_generator.lock"
 
 sys.path.insert(0, str(Path(__file__).parent))
-from persona import HOSTS, get_host, build_host_prompt, STATION_NAME
+from persona import build_host_prompt  # noqa: E402
+from context import load_intent, format_prompt_context  # noqa: E402
+from ledger import append_event, event_id  # noqa: E402
+from topic_bank import merge_topic_pools  # noqa: E402
 
 # =============================================================================
 # SEGMENT TYPE DEFINITIONS
 # =============================================================================
 
 SEGMENT_WORD_TARGETS = {
-    # Long-form
-    "deep_dive": (1500, 2500),
-    "news_analysis": (1500, 2000),
-    "interview": (2000, 3000),
-    "panel": (2000, 3000),
-    "story": (1500, 2500),
-    "listener_mailbag": (1500, 2000),
-    "music_essay": (1500, 2500),
+    # Hosted talk breaks
+    "deep_dive": (550, 900),
+    "news_analysis": (500, 800),
+    "interview": (700, 1000),
+    "panel": (700, 1000),
+    "story": (500, 850),
+    "listener_mailbag": (450, 750),
+    "music_essay": (550, 900),
     # Short-form
     "station_id": (15, 30),
-    "show_intro": (80, 150),
-    "show_outro": (60, 120),
+    "show_intro": (40, 80),
+    "show_outro": (35, 70),
 }
 
 SEGMENT_PROMPTS = {
-    "deep_dive": """Write an extended exploration of this topic. Go deep.
-Build your central idea through stories, examples, tangents.
-Let one thought lead naturally to another. Circle back to earlier threads.
+    "deep_dive": """Write a focused exploration of this topic for a music-forward station.
+Build one central idea through 2-3 vivid examples or short tangents.
+Leave room for music to carry the feeling after the break.
 Include specific details: years, names, places when relevant.
-Structure: open with a hook, develop through 3-4 connected ideas, land somewhere unexpected.
+Structure: open with a hook, develop one connected thread, land somewhere memorable.
 Use [pause] for natural rhythm. Output ONLY the spoken words.""",
 
     "news_analysis": """Analyze these headlines through a late-night lens.
@@ -95,17 +102,17 @@ HEADLINES:
 
 Use [pause] for natural rhythm. Output ONLY the spoken words.""",
 
-    "interview": """Write a simulated interview where you (the host) talk with {guest_name}.
+    "interview": """Write a compact simulated interview where you (the host) talk with {guest_name}.
 Format with HOST: and GUEST: markers on separate lines.
 The guest is a fictional/composite character, not a real living person being impersonated.
 The conversation should feel natural - interruptions, tangents, moments of surprise.
-Build to genuine insight or revelation.
+Build quickly to one genuine insight or revelation, then get out.
 Use [pause] for natural rhythm. Output ONLY the spoken dialogue.""",
 
-    "panel": """Write a discussion between two hosts on this topic.
+    "panel": """Write a compact discussion between two hosts on this topic.
 Format with HOST_A: and HOST_B: markers on separate lines.
 They have different perspectives but mutual respect.
-The conversation should build - start with disagreement, find nuance, reach unexpected common ground.
+The conversation should build - start with disagreement, find nuance, reach common ground.
 Include moments of genuine surprise and humor.
 Use [pause] for natural rhythm. Output ONLY the spoken dialogue.""",
 
@@ -122,23 +129,23 @@ Respond to each with genuine warmth and thoughtfulness.
 Format: read the message, then respond. Natural transitions between letters.
 Use [pause] for natural rhythm. Output ONLY the spoken words.""",
 
-    "music_essay": """Write an extended essay about music.
+    "music_essay": """Write a focused essay about music.
 This is not a review. It's a love letter, an excavation, a meditation.
 Pick a specific angle: a single song, a studio, a year, a collaboration, a genre's birth.
 Use vivid, sensory language. Make the listener hear what you're describing.
 Be specific with details but universal with feeling.
 Use [pause] for natural rhythm. Output ONLY the spoken words.""",
 
-    "station_id": """Write a 15-30 word station ID for WRIT-FM.
+    "station_id": """Write a 15-30 word station ID for {station_name}.
 Be cryptic but warm. Reference the frequency, the signal, the persistence of broadcasting.
 Output ONLY the spoken text. No quotes, headers, or explanations.""",
 
-    "show_intro": """Write an 80-150 word opening for the show.
+    "show_intro": """Write a 40-80 word opening for the show.
 Welcome listeners. Set the mood. Hint at what's ahead without being specific.
 Ground the listener in time and space - what hour is it, what kind of night.
 Output ONLY the spoken text.""",
 
-    "show_outro": """Write a 60-120 word show closing.
+    "show_outro": """Write a 35-70 word show closing.
 Thank the listener for staying. Acknowledge the time spent together.
 Hint at what's next on the station. Leave them with something to carry.
 Output ONLY the spoken text.""",
@@ -238,7 +245,335 @@ TOPIC_POOLS = {
         "Dedications and confessions from the inbox",
         "Where are you listening from? - the geography of our audience",
     ],
+    "open_issues": [
+        "Bug reports from ordinary life - when the repro steps are feelings",
+        "Listener pull requests - small patches for daily routines",
+        "Unclosed tabs of the mind - what we keep meaning to finish",
+        "Error budgets for being human - choosing what can fail gracefully",
+        "Questions from the issue queue - unresolved threads worth reopening",
+    ],
+    "debugging_culture": [
+        "What a stack trace is trying to confess",
+        "Why the hardest bugs only happen after midnight",
+        "The strange intimacy of reading another person's logs",
+        "How calm becomes infrastructure during an incident",
+        "The difference between fixing a bug and understanding it",
+    ],
+    "systems_dreams": [
+        "What machines remember after a restart",
+        "Queues as dreams the system has not processed yet",
+        "The emotional life of suspended state",
+        "Why clocks are the most fragile dependency",
+        "Cold boot as ritual, not reset",
+    ],
+    "software_craft": [
+        "The dignity of a small diff",
+        "Why readable code is a gift to strangers",
+        "Abstractions that earn their keep",
+        "The quiet discipline of deleting code",
+        "How maintenance becomes taste",
+    ],
+    "internet_history": [
+        "Protocols as forgotten social contracts",
+        "The fossil record inside old RFCs",
+        "Why obsolete systems rarely disappear",
+        "Compatibility as a moral choice",
+        "The human drama behind boring standards",
+    ],
+    "failure_analysis": [
+        "What changed? The first useful question",
+        "How small assumptions become large outages",
+        "Why blame destroys evidence",
+        "Monitoring as a promise to notice",
+        "The anatomy of a near miss",
+    ],
+    "tool_design": [
+        "The human is not the edge case",
+        "Friction as information, not inconvenience",
+        "Why good tools let people recover",
+        "Interfaces that teach patience or panic",
+        "The emotional cost of bad defaults",
+    ],
+    "technical_debate": [
+        "Ship now versus understand first",
+        "When pragmatism becomes technical debt",
+        "The tradeoff between clever and clear",
+        "How teams decide what good enough means",
+        "The politics hidden inside architecture choices",
+    ],
 }
+
+TOPIC_POOL_EXPANSIONS = {
+    "philosophy": [
+        "The ethics of attention - what we owe the thing we notice",
+        "Private rituals in public spaces - tiny ceremonies no one sees",
+        "The difference between solitude and being left alone",
+        "How objects become witnesses to a life",
+        "The mood of thresholds - doors, stations, lobbies, and departures",
+        "Why unfinished conversations keep broadcasting inside us",
+        "The ordinary sublime - grocery aisles, laundromats, and late buses",
+        "Patience as a form of intelligence",
+        "What repetition teaches that novelty refuses to say",
+        "The private weather of a room after everyone leaves",
+        "Why some memories arrive with sound but no picture",
+        "The strange mercy of not knowing what happens next",
+        "How names change when nobody is around to use them",
+        "The difference between a sign and a signal",
+        "Why the future always borrows furniture from the past",
+    ],
+    "music_history": [
+        "The cassette demo as prophecy - rough versions that knew the future",
+        "How drum machines changed the politics of the studio",
+        "Session musicians as anonymous architects of memory",
+        "The hidden life of compilation records",
+        "How church basements became rehearsal rooms for whole genres",
+        "The railroad map inside American music",
+        "Why some microphones have a sound before anyone sings",
+        "The economics of the three-minute single",
+        "Dub plates, acetates, and music meant to vanish",
+        "The nightclub sound system as an instrument",
+        "How regional radio DJs broke national taste",
+        "The producer as translator between chaos and song",
+        "Lost labels that changed everything for a few city blocks",
+        "Why live albums are arguments with the studio",
+        "The secret emotional labor of the backing vocalist",
+    ],
+    "current_events": [
+        "What institutions sound like when they are losing trust",
+        "The politics of delay - who benefits when decisions wait",
+        "Supply chains as invisible weather",
+        "Public safety and the language of permission",
+        "How maps become arguments during a crisis",
+        "The new etiquette of artificial intelligence at work",
+        "Why housing debates keep avoiding the word home",
+        "Labor organizing in places that were designed to be temporary",
+        "The quiet politics of public libraries",
+        "When data dashboards become moral theater",
+        "The attention economy after everyone knows the trick",
+        "How local news disappears before democracy notices",
+        "The difference between resilience and being abandoned",
+        "What disaster preparation reveals about social class",
+        "Why every generation thinks the conversation got worse",
+    ],
+    "culture": [
+        "The etiquette of borrowing a charger from a stranger",
+        "Hotel lobbies as temporary democracies",
+        "The sociology of the corner store",
+        "What laundromats know about neighborhood time",
+        "Why barbershops and salons are unofficial archives",
+        "The emotional geography of a good booth in a diner",
+        "How thrift stores become museums with price tags",
+        "The quiet codes of regulars and newcomers",
+        "Why people still read flyers stapled to telephone poles",
+        "The kitchen table as a broadcast desk",
+        "Public benches and the politics of who gets to rest",
+        "The afterlife of malls as weatherproof town squares",
+        "How small talk keeps cities from becoming machines",
+        "The social contract of holding the door",
+        "Why some neighborhoods are remembered by smell before name",
+    ],
+    "soul_music": [
+        "The hi-hat as heartbeat in 1970s soul",
+        "Why the bridge is where soul songs tell the truth",
+        "The bass player as emotional narrator",
+        "Handclaps, foot stomps, and the body as rhythm section",
+        "The politics of sweetness in protest music",
+        "How falsetto became a language of vulnerability",
+        "The string arrangement that turns heartbreak cinematic",
+        "Quiet storm as architecture for intimacy",
+        "Why a horn stab can sound like an answer",
+        "The church shout hiding inside secular radio",
+        "Family bands and the sound of shared timing",
+        "How disco taught grief to keep moving",
+        "The space between pocket and swing",
+        "Why soul ballads leave room for breath",
+        "The producer who knew when not to fix the take",
+    ],
+    "night_philosophy": [
+        "The moon as the oldest public light",
+        "Why clocks feel accusatory after midnight",
+        "The nocturnal grammar of empty streets",
+        "How dreams edit the day without asking permission",
+        "The kindness of a lamp in one window",
+        "Why distant traffic becomes oceanic at 3am",
+        "The hour when regret becomes practical",
+        "Insomnia and the archive of unfinished thoughts",
+        "The metaphysics of a refrigerator light",
+        "Why whispered voices feel more truthful",
+        "What darkness gives back to the imagination",
+        "The difference between being awake and being available",
+        "How night turns ordinary rooms into stages",
+        "The private theology of trying to sleep",
+        "Why dawn feels like forgiveness even when nothing changed",
+    ],
+    "listeners": [
+        "Messages from parked cars - where people listen between destinations",
+        "The first song you remember hearing alone",
+        "Calls from night-shift kitchens and loading docks",
+        "The record someone gave you and what it cost them",
+        "Listener maps - drawing a station from points of attention",
+        "The song you cannot play casually anymore",
+        "Questions from people who should be sleeping",
+        "Dedications to people who will never hear them",
+        "The places where the station keeps you company",
+        "Letters about parents, mixtapes, and inherited taste",
+        "What listeners hear in the static between songs",
+        "The city you left and the song that still knows it",
+        "Requests that are really confessions",
+        "Messages from long drives with no destination",
+        "The private histories hidden inside public songs",
+    ],
+    "open_issues": [
+        "Life tickets with no owner - deciding what is actually actionable",
+        "The difference between a workaround and a way through",
+        "Personal backlogs and the courage to close wontfix",
+        "When the expected behavior was never specified",
+        "Triage for days that arrive already overloaded",
+        "The bug you keep because it reminds you how the system works",
+        "When a feature request is really a loneliness report",
+        "Reopening issues that past versions of you closed too early",
+        "Why some problems need labels before they need solutions",
+        "The kindness of a small reproducible example",
+        "What to do when the acceptance criteria are a feeling",
+        "The release notes for becoming a little less stuck",
+        "When the incident commander is also the incident",
+        "The difference between unresolved and still alive",
+        "How to archive a thread without pretending it is over",
+    ],
+    "debugging_culture": [
+        "The first five minutes after the alert",
+        "Why logs are biographies written by machines",
+        "The quiet heroism of narrowing scope",
+        "How a dashboard teaches people what to fear",
+        "The difference between a symptom and a confession",
+        "Why the weird bug is often the honest bug",
+        "Debugging as hospitality for future maintainers",
+        "The ritual of saying what changed out loud",
+        "When correlation looks guilty but has an alibi",
+        "The moral value of good timestamps",
+        "Why incident rooms need calm more than brilliance",
+        "The aftercare nobody schedules after a production fire",
+        "How a log line becomes a cultural artifact",
+        "The danger of being certain too early",
+        "Why the best debugger asks simpler questions",
+    ],
+    "systems_dreams": [
+        "Cache invalidation as a story about memory and trust",
+        "What a queue hopes for while it waits",
+        "The dream logic of eventual consistency",
+        "Why retries sound like stubbornness",
+        "The sleep cycle of a cluster under load",
+        "Replication lag and the loneliness of copies",
+        "Heartbeats as proof of life",
+        "The ritual meaning of a graceful shutdown",
+        "What garbage collection knows about letting go",
+        "The private life of idle workers",
+        "Why cold storage sounds like a mythological place",
+        "The difference between uptime and being well",
+        "How failover rehearses grief before it happens",
+        "The poetry of a process waiting on input",
+        "Why state always has a past",
+    ],
+    "software_craft": [
+        "The small kindness of a good variable name",
+        "Why tests are letters to tomorrow",
+        "Refactoring as changing the question without changing the answer",
+        "The taste involved in deleting a feature",
+        "Why boring code is sometimes the brave code",
+        "The social contract hidden inside an interface",
+        "How documentation becomes maintenance infrastructure",
+        "The danger of abstractions that flatter the author",
+        "Why review comments need verbs, not vibes",
+        "The craft of making failure legible",
+        "When a helper function earns its name",
+        "How local conventions preserve team memory",
+        "The dignity of fixing the thing near the thing",
+        "Why build scripts deserve design attention",
+        "The discipline of leaving a clean diff behind",
+    ],
+    "internet_history": [
+        "The etiquette encoded in early mailing lists",
+        "Why FTP directories felt like hidden cities",
+        "The social life of user agents",
+        "How broken links became ruins",
+        "Standards committees as slow-motion drama",
+        "The bulletin board as neighborhood infrastructure",
+        "What old web rings understood about belonging",
+        "The politics of default ports",
+        "Why protocols outlive the companies that popularized them",
+        "The cultural memory inside error codes",
+        "How packet switching changed imagination",
+        "The browser wars as a fight over daily life",
+        "Why compatibility layers feel haunted",
+        "The archival value of obsolete documentation",
+        "What early forums knew about moderation before platforms scaled",
+    ],
+    "failure_analysis": [
+        "The meeting after the incident and what it refuses to say",
+        "Why root cause is rarely a root",
+        "The organizational smell of a missing owner",
+        "How paging policy becomes labor policy",
+        "The difference between detection and understanding",
+        "Why postmortems need narrative discipline",
+        "The danger of a green dashboard after a bad week",
+        "How near misses teach without the drama of failure",
+        "Why remediation without ownership becomes folklore",
+        "The emotional half-life of an outage",
+        "What incident timelines reveal about trust",
+        "How small defaults become large blast radiuses",
+        "The cost of alerts nobody believes",
+        "Why reliability work is mostly memory work",
+        "The quiet politics of severity labels",
+    ],
+    "tool_design": [
+        "Undo buttons as a philosophy of forgiveness",
+        "Why defaults are promises, not shortcuts",
+        "The interface that respects interruption",
+        "How empty states teach users what matters",
+        "The difference between guidance and condescension",
+        "Why speed without reversibility creates fear",
+        "The emotional texture of a loading state",
+        "How keyboard shortcuts reveal power structures",
+        "The kindness of making dangerous actions explicit",
+        "Why good forms ask only what they can use",
+        "How tooltips become tiny acts of care",
+        "The politics of notification badges",
+        "Why export buttons are trust mechanisms",
+        "The design value of saying no clearly",
+        "How a tool earns the right to be quiet",
+    ],
+    "technical_debate": [
+        "Rewrite versus repair when the old system still works",
+        "Should architecture optimize for experts or newcomers",
+        "The case for fewer dependencies and the case against purity",
+        "When speed is a feature and when it is a trap",
+        "The moral hazard of temporary infrastructure",
+        "Types as guardrails versus types as theater",
+        "Why observability can become surveillance if handled badly",
+        "Should teams standardize early or let patterns emerge",
+        "The tradeoff between local clarity and global consistency",
+        "When a monolith is a kindness",
+        "The cost of clever automation that nobody owns",
+        "How much process should a small team tolerate",
+        "The tension between user empathy and operator sanity",
+        "When to preserve weirdness and when to normalize it",
+        "The argument hidden inside every build-vs-buy decision",
+    ],
+}
+
+for focus, extra_topics in TOPIC_POOL_EXPANSIONS.items():
+    pool = TOPIC_POOLS.setdefault(focus, [])
+    seen = {topic.lower() for topic in pool}
+    for topic in extra_topics:
+        key = topic.lower()
+        if key not in seen:
+            seen.add(key)
+            pool.append(topic)
+
+
+def effective_topic_pools() -> dict[str, list[str]]:
+    """Built-in topics plus station-local operator-added topics."""
+    return merge_topic_pools(TOPIC_POOLS)
 
 # Guest characters for interview segments
 INTERVIEW_GUESTS = [
@@ -254,19 +589,353 @@ INTERVIEW_GUESTS = [
 
 
 # =============================================================================
+# SHOW LOG — persistent memory across sessions
+# =============================================================================
+
+
+@contextmanager
+def generation_lock():
+    """Serialize TTS-heavy talk generation across all station operators."""
+    LOCK_PATH.parent.mkdir(parents=True, exist_ok=True)
+    with LOCK_PATH.open("w") as lock_file:
+        log(f"Waiting for talk generator lock: {LOCK_PATH}")
+        fcntl.flock(lock_file, fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(lock_file, fcntl.LOCK_UN)
+
+
+def read_show_log(show_id: str, n: int = 10) -> list[dict]:
+    """Read the last N entries from a show's log."""
+    log_file = SHOW_LOG_DIR / f"{show_id}.jsonl"
+    if not log_file.exists():
+        return []
+    entries = []
+    for line in log_file.read_text().strip().split("\n"):
+        if line.strip():
+            try:
+                entries.append(json.loads(line))
+            except json.JSONDecodeError:
+                continue
+    return entries[-n:]
+
+
+def append_show_log(show_id: str, segment_type: str, topic: str, summary: str):
+    """Append an entry to a show's log after generating a segment."""
+    SHOW_LOG_DIR.mkdir(parents=True, exist_ok=True)
+    log_file = SHOW_LOG_DIR / f"{show_id}.jsonl"
+    entry = {
+        "date": datetime.now().strftime("%Y-%m-%d"),
+        "hour": datetime.now().hour,
+        "type": segment_type,
+        "topic": topic,
+        "summary": summary,
+    }
+    with open(log_file, "a") as f:
+        f.write(json.dumps(entry) + "\n")
+
+
+def format_show_log_for_prompt(show_id: str) -> str:
+    """Format recent show log entries for injection into generation prompt."""
+    entries = read_show_log(show_id)
+    if not entries:
+        return ""
+    lines = ["RECENT EPISODES (already covered — do NOT repeat or pick a close variant; choose a clearly different angle/topic):"]
+    for e in entries:
+        lines.append(f"- [{e.get('date','')}] {e.get('type','')}: {e.get('topic','')} — {e.get('summary','')}")
+    return "\n".join(lines)
+
+
+# =============================================================================
+# LISTENER MESSAGES — real messages from real listeners
+# =============================================================================
+
+
+def get_listener_messages(n: int = 5) -> list[dict]:
+    """Get recent listener messages for on-air use."""
+    if not MESSAGES_FILE.exists():
+        return []
+    try:
+        messages = json.loads(MESSAGES_FILE.read_text())
+    except Exception:
+        return []
+    # Filter to substantive messages (skip "hi", "hey", etc.)
+    substantive = [
+        m for m in messages
+        if len(m.get("message", "")) > 20
+        and m.get("read", False)
+    ]
+    # Most recent first
+    substantive.sort(key=lambda m: m.get("timestamp", ""), reverse=True)
+    return substantive[:n]
+
+
+def format_messages_for_prompt() -> str:
+    """Format listener messages for injection into generation prompt."""
+    messages = get_listener_messages()
+    if not messages:
+        return ""
+    lines = ["LISTENER MESSAGES (real messages from real listeners — weave 1-2 into your segment naturally):"]
+    for m in messages:
+        ts = m.get("timestamp", "")[:10]
+        lines.append(f"- [{ts}] \"{m['message']}\"")
+    return "\n".join(lines)
+
+
+# =============================================================================
+# SHOW PLANNER — generates structured show outlines
+# =============================================================================
+
+
+def generate_show_plan(
+    show_id: str,
+    show_name: str,
+    show_description: str,
+    host_id: str,
+    topic_focus: str,
+    segment_types: list[str],
+) -> list[dict] | None:
+    """Generate a structured show plan using Claude.
+
+    Returns a list of segment specs: [{"type": ..., "topic": ..., "note": ...}, ...]
+    """
+    recent_log = format_show_log_for_prompt(show_id)
+    messages = format_messages_for_prompt()
+    now = datetime.now()
+
+    prompt = f"""You are planning the next episode of {show_name} on {STATION.call_sign}.
+Host: {host_id}
+Description: {show_description}
+Focus: {topic_focus}
+Time: {now.strftime('%A, %B %d, %Y at %I:%M %p')}
+
+Available segment types (use EXACTLY these names with underscores): {', '.join(segment_types + ['show_intro', 'show_outro'])}
+
+{recent_log}
+
+{messages}
+
+Design a compact talk plan with 3-4 spoken breaks. The episode should have:
+1. A show_intro (very short welcome, ground the listener in time and mood)
+2. 1-2 main segments with a THEMATIC THROUGHLINE connecting them
+3. If listener messages are available, use one listener_mailbag as a main segment
+4. A show_outro (briefly wrap the thread, then hand the station back to music)
+
+Output ONLY a JSON array. Each element: {{"type": "segment_type", "topic": "specific topic", "note": "brief direction for this segment"}}
+
+Example:
+[
+  {{"type": "show_intro", "topic": "Welcome to The Night Garden", "note": "Ground in the late hour, hint at tonight's theme of sleep and surrender"}},
+  {{"type": "deep_dive", "topic": "The architecture of lullabies", "note": "Main exploration — why these melodies work on the nervous system"}},
+  {{"type": "show_outro", "topic": "Signing off", "note": "Wrap the thread about surrender and rest"}}
+]"""
+
+    result = run_claude(prompt, timeout=60, min_length=50, strip_quotes=False)
+    if not result:
+        return None
+
+    # Extract JSON from response
+    try:
+        # Find the JSON array in the response
+        start = result.index("[")
+        end = result.rindex("]") + 1
+        plan = json.loads(result[start:end])
+        if isinstance(plan, list) and len(plan) >= 3:
+            return plan
+    except (ValueError, json.JSONDecodeError):
+        pass
+
+    log("  Failed to parse show plan")
+    return None
+
+
+def generate_planned_show(
+    show_id: str,
+    schedule: "StationSchedule",
+    slot: str,
+) -> int:
+    """Generate a full planned show — intro, themed segments, outro — into a slot folder."""
+    if show_id not in schedule.shows:
+        log(f"Unknown show: {show_id}")
+        return 0
+
+    show = schedule.shows[show_id]
+
+    log(f"\n{'='*60}")
+    log(f"Planning show: {show.name} [slot {slot}]")
+    log(f"{'='*60}")
+
+    # Generate the plan
+    plan = generate_show_plan(
+        show_id=show_id,
+        show_name=show.name,
+        show_description=show.description,
+        host_id=show.host,
+        topic_focus=show.topic_focus,
+        segment_types=show.segment_types,
+    )
+
+    if not plan:
+        log("  Plan generation failed, falling back to random segments")
+        return generate_for_show(show_id, schedule, slot=slot, count=2)
+
+    log(f"  Plan: {len(plan)} segments")
+    for i, seg in enumerate(plan):
+        log(f"    {i+1}. [{seg['type']}] {seg['topic']}")
+
+    # Normalize segment type names (Claude sometimes omits underscores)
+    TYPE_ALIASES = {
+        "showintro": "show_intro", "showoutro": "show_outro",
+        "stationid": "station_id", "deepdive": "deep_dive",
+        "newsanalysis": "news_analysis", "musicessay": "music_essay",
+        "listenermailbag": "listener_mailbag",
+    }
+    for seg in plan:
+        seg["type"] = TYPE_ALIASES.get(seg["type"], seg["type"])
+
+    # Generate each segment in order, with context from previous segments
+    success = 0
+    show_context_so_far = []
+
+    for i, seg in enumerate(plan):
+        seg_type = seg["type"]
+        topic = seg["topic"]
+        note = seg.get("note", "")
+
+        # Validate segment type
+        if seg_type not in SEGMENT_WORD_TARGETS:
+            log(f"  Skipping unknown type: {seg_type}")
+            continue
+
+        log(f"\n[{i+1}/{len(plan)}]")
+
+        result = generate_segment(
+            show_id=show_id,
+            show_name=show.name,
+            show_description=show.description,
+            host_id=show.host,
+            topic_focus=show.topic_focus,
+            segment_type=seg_type,
+            voices=dict(show.voices),
+            slot=slot,
+            topic=topic,
+            sequence=i,
+            plan_note=note,
+            prior_segments=show_context_so_far,
+        )
+
+        if result:
+            success += 1
+            show_context_so_far.append(f"[{seg_type}] {topic}")
+
+        if i < len(plan) - 1:
+            time.sleep(2)
+
+    return success
+
+
+# =============================================================================
 # CORE GENERATION
 # =============================================================================
 
 
-def select_topic(topic_focus: str, segment_type: str) -> str:
-    """Pick a topic from the pool matching the show's focus."""
-    pool = TOPIC_POOLS.get(topic_focus, [])
+def slugify_topic(topic: str) -> str:
+    """Return the topic slug format used in generated audio filenames."""
+    topic_slug = topic[:30].lower()
+    for char in ' -:,\'".?!()':
+        topic_slug = topic_slug.replace(char, "_")
+    return "_".join(filter(None, topic_slug.split("_")))
+
+
+def extract_topic_slug_from_filename(path: Path) -> str:
+    """Best-effort extraction of the topic slug from a generated segment filename."""
+    stem = path.stem
+    parts = stem.split("_")
+    if len(parts) < 4:
+        return ""
+    if len(parts[0]) == 2 and parts[0].isdigit():
+        parts = parts[1:]
+    if len(parts) < 4:
+        return ""
+    if parts[-2].isdigit() and parts[-1].isdigit():
+        parts = parts[:-2]
+
+    segment_types = sorted(SEGMENT_WORD_TARGETS, key=lambda s: len(s.split("_")), reverse=True)
+    for segment_type_name in segment_types:
+        prefix = segment_type_name.split("_")
+        if parts[: len(prefix)] == prefix:
+            return "_".join(parts[len(prefix):])
+    return ""
+
+
+def slot_topic_slugs(show_id: str, slot: str) -> set[str]:
+    """Return topic slugs already present in a slot's unaired audio files."""
+    slot_dir = OUTPUT_DIR / show_id / slot
+    if not slot_dir.exists():
+        return set()
+    return {
+        slug
+        for slug in (extract_topic_slug_from_filename(path) for path in slot_dir.glob("*.wav"))
+        if slug
+    }
+
+
+def _matches_avoid(topic: str, avoid_topics: list[str] | None) -> bool:
+    topic_key = topic.lower()
+    for avoid in avoid_topics or []:
+        avoid_key = str(avoid).strip().lower()
+        if not avoid_key:
+            continue
+        if topic_key == avoid_key or avoid_key in topic_key or topic_key in avoid_key:
+            return True
+    return False
+
+
+def select_topic(
+    topic_focus: str,
+    segment_type: str,
+    show_id: str | None = None,
+    avoid_topics: list[str] | None = None,
+    avoid_slugs: set[str] | None = None,
+) -> str:
+    """Pick a topic, avoiding recent, requested, and in-slot repeats."""
+    topic_pools = effective_topic_pools()
+    pool = topic_pools.get(topic_focus, [])
     if not pool:
-        # Fall back to a combined pool
         all_topics = []
-        for topics in TOPIC_POOLS.values():
+        for topics in topic_pools.values():
             all_topics.extend(topics)
         pool = all_topics
+    avoid_slugs = avoid_slugs or set()
+
+    def allowed(topic: str) -> bool:
+        return not _matches_avoid(topic, avoid_topics) and slugify_topic(topic) not in avoid_slugs
+
+    # Avoid topics covered recently. If the pool has been fully cycled,
+    # prefer the least-recently-used topic over a random rerun of a recent one.
+    if show_id:
+        recent = read_show_log(show_id, n=40)
+        recent_order = [e.get("topic", "").lower() for e in recent]
+        recent_set = set(recent_order)
+        fresh = [t for t in pool if t.lower() not in recent_set and allowed(t)]
+        if fresh:
+            pool = fresh
+        else:
+            # Sort pool by how long ago each topic last aired (oldest first).
+            # read_show_log returns oldest→newest; higher index = more recent.
+            def most_recent_idx(t: str) -> int:
+                key = t.lower()
+                idx = -1
+                for i, rt in enumerate(recent_order):
+                    if rt == key:
+                        idx = i
+                return idx
+            lru_pool = [t for t in sorted(pool, key=most_recent_idx) if allowed(t)]
+            pool = lru_pool[: max(1, len(pool) // 3)] or [t for t in pool if allowed(t)] or pool
+    else:
+        pool = [t for t in pool if allowed(t)] or pool
+
     return random.choice(pool)
 
 
@@ -277,7 +946,11 @@ def build_generation_prompt(
     show_name: str,
     show_description: str,
     topic_focus: str,
+    show_id: str | None = None,
     guest_voice: str | None = None,
+    plan_note: str | None = None,
+    prior_segments: list[str] | None = None,
+    intent_context: str | None = None,
 ) -> str:
     """Build the full prompt for content generation."""
     show_context = {
@@ -288,9 +961,10 @@ def build_generation_prompt(
     }
     base = build_host_prompt(host_id, show_context)
 
-    min_words, max_words = SEGMENT_WORD_TARGETS.get(segment_type, (1500, 2500))
+    min_words, max_words = SEGMENT_WORD_TARGETS.get(segment_type, (550, 900))
 
     prompt_template = SEGMENT_PROMPTS.get(segment_type, SEGMENT_PROMPTS["deep_dive"])
+    prompt_template = prompt_template.replace("{station_name}", STATION.call_sign)
 
     # Handle special template vars
     if segment_type == "news_analysis":
@@ -302,10 +976,43 @@ def build_generation_prompt(
         prompt_template = prompt_template.format(guest_name=guest["name"])
         topic = f"{topic} (Guest context: {guest['context']})"
     elif segment_type == "panel":
-        # Panel uses two hosts
         pass
 
+    # Build context layers
+    context_parts = []
+
+    # Show log is intentionally NOT injected into the per-segment prompt:
+    # `select_topic` already filters recent topics out of the static pool,
+    # and listing recent topics in the LLM's context was acting as a
+    # suggestion-bank rather than an avoid-list (cross-batch anchoring).
+    # The episode planner still uses show_log where continuity matters.
+
+    # Listener messages — real voices from the audience
+    if segment_type in ("listener_mailbag", "show_intro", "deep_dive"):
+        messages = format_messages_for_prompt()
+        if messages:
+            context_parts.append(messages)
+
+    # Show plan context — what came earlier in this episode
+    if prior_segments:
+        context_parts.append(
+            "EARLIER IN THIS EPISODE (maintain the throughline, reference what you've already said):\n"
+            + "\n".join(f"- {s}" for s in prior_segments)
+        )
+
+    # Plan note — direction from the show planner
+    if plan_note:
+        context_parts.append(f"DIRECTION: {plan_note}")
+
+    # Operator intent — curated continuity, avoidance, tone, and thread choices
+    if intent_context:
+        context_parts.append(intent_context)
+
+    context_block = "\n\n".join(context_parts)
+
     prompt = f"""{base}
+
+{context_block}
 
 SEGMENT: {segment_type}
 TOPIC: {topic}
@@ -318,7 +1025,7 @@ TARGET LENGTH: {min_words}-{max_words} words
 
 def run_generation(prompt: str, segment_type: str) -> str | None:
     """Run Claude CLI to generate the script."""
-    min_words, max_words = SEGMENT_WORD_TARGETS.get(segment_type, (1500, 2500))
+    min_words, max_words = SEGMENT_WORD_TARGETS.get(segment_type, (550, 900))
     timeout = 120 if max_words < 200 else 300
 
     script = run_claude(prompt, timeout=timeout)
@@ -385,7 +1092,8 @@ def render_multi_voice(script: str, output_path: Path, voices: dict[str, str]) -
     log(f"  Rendering {len(parts)} dialogue segments...")
 
     # Use a temp directory for chunks so the streamer doesn't consume them
-    import tempfile, shutil
+    import shutil
+    import tempfile
     tmp_dir = Path(tempfile.mkdtemp(prefix="writ_dialogue_"))
 
     # Render each part
@@ -405,7 +1113,7 @@ def render_multi_voice(script: str, output_path: Path, voices: dict[str, str]) -
                 chunk_files.append(chunk_path)
         else:
             for attempt in range(2):
-                if render_kokoro(text, chunk_path, voice):
+                if render_speech(text, chunk_path, voice):
                     chunk_files.append(chunk_path)
                     break
                 time.sleep(2)
@@ -433,13 +1141,18 @@ def generate_segment(
     topic_focus: str,
     segment_type: str,
     voices: dict[str, str],
+    slot: str,
     topic: str | None = None,
+    sequence: int | None = None,
+    plan_note: str | None = None,
+    prior_segments: list[str] | None = None,
+    intent_context: str | None = None,
 ) -> Path | None:
     """Generate a single talk segment with audio."""
     if topic is None:
-        topic = select_topic(topic_focus, segment_type)
+        topic = select_topic(topic_focus, segment_type, show_id=show_id)
 
-    min_words, max_words = SEGMENT_WORD_TARGETS.get(segment_type, (1500, 2500))
+    min_words, max_words = SEGMENT_WORD_TARGETS.get(segment_type, (550, 900))
     log(f"=== Generating {segment_type} for {show_name} ===")
     log(f"  Topic: {topic[:80]}...")
     log(f"  Target: {min_words}-{max_words} words")
@@ -453,7 +1166,11 @@ def generate_segment(
         show_name=show_name,
         show_description=show_description,
         topic_focus=topic_focus,
+        show_id=show_id,
         guest_voice=voices.get("guest"),
+        plan_note=plan_note,
+        prior_segments=prior_segments,
+        intent_context=intent_context,
     )
 
     # Try generation with one retry
@@ -474,17 +1191,15 @@ def generate_segment(
     est_minutes = word_count / 130
     log(f"  Generated {word_count} words (~{est_minutes:.1f} min)")
 
-    # Prepare output
-    show_dir = OUTPUT_DIR / show_id
-    show_dir.mkdir(parents=True, exist_ok=True)
+    # Prepare output (into slot subfolder — only plays during that airing)
+    slot_dir = OUTPUT_DIR / show_id / slot
+    slot_dir.mkdir(parents=True, exist_ok=True)
 
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    topic_slug = topic[:30].lower()
-    for char in ' -:,\'".?!()':
-        topic_slug = topic_slug.replace(char, '_')
-    topic_slug = '_'.join(filter(None, topic_slug.split('_')))
+    topic_slug = slugify_topic(topic)
 
-    output_path = show_dir / f"{segment_type}_{topic_slug}_{timestamp}.wav"
+    seq_prefix = f"{sequence:02d}_" if sequence is not None else ""
+    output_path = slot_dir / f"{seq_prefix}{segment_type}_{topic_slug}_{timestamp}.wav"
 
     # Preprocess for TTS
     processed = preprocess_for_tts(script)
@@ -511,6 +1226,8 @@ def generate_segment(
     meta_path = SCRIPTS_DIR / f"talk_{segment_type}_{timestamp}.json"
     with open(meta_path, "w") as f:
         json.dump({
+            "station_id": STATION.id,
+            "station": STATION.call_sign,
             "type": segment_type,
             "show_id": show_id,
             "show_name": show_name,
@@ -524,37 +1241,91 @@ def generate_segment(
         }, f, indent=2)
 
     log(f"  Created: {output_path.name} ({duration_str})")
+
+    # Append to show log — summarize for continuity
+    summary = script[:200].replace("\n", " ").strip()
+    if len(script) > 200:
+        summary += "..."
+    append_show_log(show_id, segment_type, topic, summary)
+
+    append_event({
+        "id": event_id("seg", str(output_path), datetime.now().isoformat(timespec="seconds")),
+        "station_id": STATION.id,
+        "type": "segment_generated",
+        "time": datetime.now().isoformat(timespec="seconds"),
+        "show_id": show_id,
+        "segment_type": segment_type,
+        "topic": topic,
+        "summary": summary,
+        "path": str(output_path),
+        "word_count": word_count,
+        "duration_seconds": duration,
+        "tags": ["generated", segment_type, show_id],
+    })
+
     return output_path
 
 
 def generate_for_show(
     show_id: str,
     schedule: StationSchedule,
+    slot: str,
     count: int = 3,
     segment_type: str | None = None,
     topic: str | None = None,
+    intent: dict | None = None,
 ) -> int:
-    """Generate segments for a specific show."""
+    """Generate segments for a specific show's slot."""
     if show_id not in schedule.shows:
         log(f"Unknown show: {show_id}")
         log(f"Available: {', '.join(schedule.shows.keys())}")
         return 0
 
     show = schedule.shows[show_id]
+    intent = intent or {}
+    intent_context = format_prompt_context(intent, show_id=show_id)
+    intent_avoid = [str(item) for item in intent.get("avoid", [])]
 
     log(f"\n{'='*60}")
-    log(f"Generating {count} segments for: {show.name}")
+    log(f"Generating {count} segments for: {show.name} [slot {slot}]")
     log(f"{'='*60}")
 
     success = 0
+    batch_topics: list[str] = []
     for i in range(count):
-        # Pick segment type
         if segment_type:
             st = segment_type
+        elif intent.get("segment_type"):
+            st = str(intent["segment_type"])
         else:
             st = random.choice(show.segment_types)
 
+        explicit_topic = topic if topic is not None else intent.get("topic")
+        if explicit_topic is not None:
+            segment_topic = str(explicit_topic)
+        else:
+            segment_topic = select_topic(
+                show.topic_focus,
+                st,
+                show_id=show_id,
+                avoid_topics=[*intent_avoid, *batch_topics],
+                avoid_slugs=slot_topic_slugs(show_id, slot),
+            )
+
         log(f"\n[{i+1}/{count}]")
+
+        # Inject just-generated batch topics as a hard avoid list so the LLM
+        # doesn't anchor on the previous segment's topic within the same slot.
+        batch_intent_context = intent_context
+        if batch_topics:
+            avoid_block = (
+                "JUST GENERATED IN THIS SAME BATCH (do NOT repeat, rephrase, "
+                "or pick a close sibling of these — pick a clearly different topic):\n"
+                + "\n".join(f"- {t}" for t in batch_topics)
+            )
+            batch_intent_context = (
+                f"{intent_context}\n\n{avoid_block}" if intent_context else avoid_block
+            )
 
         result = generate_segment(
             show_id=show_id,
@@ -564,10 +1335,13 @@ def generate_for_show(
             topic_focus=show.topic_focus,
             segment_type=st,
             voices=dict(show.voices),
-            topic=topic,
+            slot=slot,
+            topic=segment_topic,
+            intent_context=batch_intent_context,
         )
         if result:
             success += 1
+            batch_topics.append(segment_topic)
 
         if i < count - 1:
             time.sleep(2)
@@ -575,41 +1349,64 @@ def generate_for_show(
     return success
 
 
-def generate_for_current(schedule: StationSchedule, count: int = 3) -> int:
-    """Generate segments for the currently active show."""
-    resolved = schedule.resolve()
-    return generate_for_show(resolved.show_id, schedule, count)
+def slot_segment_count(show_id: str, slot: str) -> int:
+    """Count .wav segments currently stocked in a slot folder (excludes aired/)."""
+    slot_dir = OUTPUT_DIR / show_id / slot
+    if not slot_dir.exists():
+        return 0
+    return len(list(slot_dir.glob("*.wav")))
 
 
-def generate_all(schedule: StationSchedule, count_per_show: int = 3) -> dict[str, int]:
-    """Generate content for all shows."""
-    log("=== WRIT-FM Full Talk Content Generation ===")
-    log(f"Generating {count_per_show} segments per show")
+def stock_ahead(
+    schedule: StationSchedule,
+    airings_ahead: int = 4,
+    min_per_slot: int = 3,
+    count_per_generation: int = 2,
+) -> dict[str, int]:
+    """Walk the next N airings and top up any below threshold.
 
-    results = {}
-    for show_id in schedule.shows:
-        results[show_id] = generate_for_show(show_id, schedule, count_per_show)
+    Current airing first, then upcoming ones, in chronological order.
+    Stops at the first slot that's already stocked — returns early so the
+    operator's run stays short.
+    """
+    airings = schedule.next_airings(count=airings_ahead)
+    log(f"=== Stock-ahead: next {len(airings)} airings, min {min_per_slot} each ===")
+
+    results: dict[str, int] = {}
+    for show_id, airing_start in airings:
+        slot = slot_key(airing_start)
+        have = slot_segment_count(show_id, slot)
+        short_by = min_per_slot - have
+        label = f"{show_id}/{slot}"
+        if short_by <= 0:
+            log(f"  [ok ] {label}: {have}/{min_per_slot}")
+            continue
+        to_make = min(count_per_generation, short_by)
+        log(f"  [gen] {label}: {have}/{min_per_slot} — generating {to_make}")
+        results[label] = generate_for_show(show_id, schedule, slot=slot, count=to_make)
         time.sleep(3)
 
-    log("\n=== Generation Complete ===")
-    total = 0
-    for show_id, count in results.items():
-        show = schedule.shows[show_id]
-        log(f"  {show.name}: {count}/{count_per_show}")
-        total += count
-
-    log(f"Total: {total} segments generated")
+    total = sum(results.values())
+    log(f"\n=== Stock-ahead complete: {total} new segments ===")
     return results
 
 
-def count_segments() -> dict[str, int]:
-    """Count existing segments per show."""
-    counts = {}
-    if OUTPUT_DIR.exists():
-        for show_dir in OUTPUT_DIR.iterdir():
-            if show_dir.is_dir():
-                wavs = list(show_dir.glob("*.wav"))
-                counts[show_dir.name] = len(wavs)
+def count_segments_by_slot() -> dict[str, dict[str, int]]:
+    """Map show_id → {slot_name: count} for every existing slot folder."""
+    counts: dict[str, dict[str, int]] = {}
+    if not OUTPUT_DIR.exists():
+        return counts
+    for show_dir in OUTPUT_DIR.iterdir():
+        if not show_dir.is_dir():
+            continue
+        for slot_dir in show_dir.iterdir():
+            if not slot_dir.is_dir():
+                continue
+            try:
+                parse_slot_key(slot_dir.name)
+            except ValueError:
+                continue
+            counts.setdefault(show_dir.name, {})[slot_dir.name] = len(list(slot_dir.glob("*.wav")))
     return counts
 
 
@@ -621,19 +1418,25 @@ def count_segments() -> dict[str, int]:
 def main():
     parser = argparse.ArgumentParser(description="WRIT-FM Talk Segment Generator")
     parser.add_argument("--show", help="Show ID to generate for (default: current show)")
+    parser.add_argument("--slot", help="Slot key YYYY-MM-DD_HHMM (default: next un-stocked airing of --show, or current airing)")
     parser.add_argument("--type", dest="segment_type", help="Specific segment type")
     parser.add_argument("--topic", help="Specific topic")
-    parser.add_argument("--count", type=int, default=3, help="Segments to generate (default: 3)")
-    parser.add_argument("--all", action="store_true", help="Generate for all shows")
-    parser.add_argument("--status", action="store_true", help="Show segment counts per show")
+    parser.add_argument("--count", type=int, default=2, help="Segments to generate (default: 2)")
+    parser.add_argument("--min", type=int, default=3, help="Minimum segments per slot (default: 3)")
+    parser.add_argument("--stock-ahead", type=int, default=0, metavar="N",
+                        help="Walk next N airings and top up each to --min")
+    parser.add_argument("--all", action="store_true", help="Alias for --stock-ahead 4")
+    parser.add_argument("--plan", action="store_true", help="Generate a planned show (intro, themed segments, outro)")
+    parser.add_argument("--status", action="store_true", help="Show segment counts per upcoming slot")
     parser.add_argument("--list-types", action="store_true", help="List segment types")
     parser.add_argument("--list-topics", help="List topics for a focus area")
+    parser.add_argument("--intent", help="Operator intent card JSON to guide generation")
 
     args = parser.parse_args()
 
     if args.list_types:
         print("\n=== Segment Types ===\n")
-        print("Long-form (primary content):")
+        print("Hosted talk breaks:")
         for st in ["deep_dive", "news_analysis", "interview", "panel", "story", "listener_mailbag", "music_essay"]:
             mn, mx = SEGMENT_WORD_TARGETS[st]
             print(f"  {st:20s} {mn}-{mx} words")
@@ -645,10 +1448,11 @@ def main():
 
     if args.list_topics:
         focus = args.list_topics
-        pool = TOPIC_POOLS.get(focus)
+        topic_pools = effective_topic_pools()
+        pool = topic_pools.get(focus)
         if not pool:
             print(f"Unknown focus: {focus}")
-            print(f"Available: {', '.join(TOPIC_POOLS.keys())}")
+            print(f"Available: {', '.join(topic_pools.keys())}")
             return 1
         print(f"\n=== Topics: {focus} ===\n")
         for i, topic in enumerate(pool, 1):
@@ -663,30 +1467,66 @@ def main():
         log(f"Failed to load schedule: {e}")
         return 1
 
+    intent = load_intent(args.intent)
+    if intent:
+        log(f"Loaded operator intent: {intent.get('mode', 'unspecified')} — {intent.get('intent', '')}")
+        args.show = args.show or intent.get("show_id")
+        args.segment_type = args.segment_type or intent.get("segment_type")
+        args.topic = args.topic or intent.get("topic")
+
     if args.status:
-        counts = count_segments()
-        print("\n=== Talk Segment Inventory ===\n")
-        for show_id, show in schedule.shows.items():
-            c = counts.get(show_id, 0)
-            status = "OK" if c >= 6 else "LOW" if c >= 3 else "EMPTY"
-            print(f"  {show.name:30s} {c:3d} segments  [{status}]")
-        total = sum(counts.values())
-        print(f"\n  Total: {total} segments")
+        airings = schedule.next_airings(count=args.stock_ahead or 8)
+        by_slot = count_segments_by_slot()
+        print("\n=== Talk Segment Inventory (upcoming slots) ===\n")
+        for show_id, airing_start in airings:
+            slot = slot_key(airing_start)
+            c = by_slot.get(show_id, {}).get(slot, 0)
+            status = "OK" if c >= args.min else "LOW" if c > 0 else "EMPTY"
+            show_name = schedule.shows[show_id].name
+            print(f"  {slot}  {show_name:28s} {c:3d} segments  [{status}]")
         return 0
 
-    # Generate
-    if args.all:
-        generate_all(schedule, args.count)
-    elif args.show:
-        generate_for_show(args.show, schedule, args.count, args.segment_type, args.topic)
-    else:
-        if args.segment_type or args.topic:
-            resolved = schedule.resolve()
+    def resolve_slot(show_id: str) -> str:
+        """If --slot was given, use it. Otherwise pick the next airing of show_id
+        that hasn't met --min yet (so operator runs naturally chase empty slots)."""
+        if args.slot:
+            parse_slot_key(args.slot)  # validates
+            return args.slot
+        for candidate_show, airing_start in schedule.next_airings(count=8):
+            if candidate_show != show_id:
+                continue
+            slot = slot_key(airing_start)
+            if slot_segment_count(show_id, slot) < args.min:
+                return slot
+        # All upcoming slots for this show are stocked — fall back to current airing
+        return slot_key(schedule.airing_start())
+
+    with generation_lock():
+        if args.plan:
+            show_id = args.show or schedule.resolve().show_id
+            generate_planned_show(show_id, schedule, slot=resolve_slot(show_id))
+        elif args.all or args.stock_ahead:
+            n = args.stock_ahead or 4
+            stock_ahead(schedule, airings_ahead=n, min_per_slot=args.min, count_per_generation=args.count)
+        elif args.show:
             generate_for_show(
-                resolved.show_id, schedule, args.count, args.segment_type, args.topic
+                args.show, schedule,
+                slot=resolve_slot(args.show),
+                count=args.count,
+                segment_type=args.segment_type,
+                topic=args.topic,
+                intent=intent,
             )
         else:
-            generate_for_current(schedule, args.count)
+            resolved = schedule.resolve()
+            generate_for_show(
+                resolved.show_id, schedule,
+                slot=resolve_slot(resolved.show_id),
+                count=args.count,
+                segment_type=args.segment_type,
+                topic=args.topic,
+                intent=intent,
+            )
 
     return 0
 

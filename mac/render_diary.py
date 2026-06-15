@@ -1,0 +1,152 @@
+#!/usr/bin/env python3
+"""Render the operator's diary as a static HTML page for the public site."""
+
+from __future__ import annotations
+
+import argparse
+import html
+import json
+import sys
+from collections import defaultdict
+from datetime import datetime
+from pathlib import Path
+
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(PROJECT_ROOT / "mac"))
+from station_config import load_station_config  # noqa: E402
+
+STATION = load_station_config()
+LEDGER_PATH = STATION.ledger_path
+DEFAULT_HTML_OUTPUT = PROJECT_ROOT / "docs" / "diary.html"
+DEFAULT_JSON_OUTPUT = PROJECT_ROOT / "docs" / "diary.json"
+
+
+def load_diary() -> list[dict]:
+    if not LEDGER_PATH.exists():
+        return []
+    entries: list[dict] = []
+    for line in LEDGER_PATH.read_text().splitlines():
+        if not line.strip():
+            continue
+        try:
+            event = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if event.get("type") == "diary_entry":
+            entries.append(event)
+    entries.sort(key=lambda e: e.get("time", ""), reverse=True)
+    return entries
+
+
+def format_day(date_str: str) -> str:
+    return datetime.strptime(date_str, "%Y-%m-%d").strftime("%A, %B %-d, %Y")
+
+
+def render(entries: list[dict]) -> str:
+    by_day: dict[str, list[dict]] = defaultdict(list)
+    for entry in entries:
+        time = entry.get("time", "")
+        if len(time) < 10:
+            continue
+        by_day[time[:10]].append(entry)
+
+    sections: list[str] = []
+    for day in sorted(by_day, reverse=True):
+        block = [f'<h2 class="diary-day">{html.escape(format_day(day))}</h2>']
+        for entry in by_day[day]:
+            time = entry.get("time", "")
+            mode = (entry.get("mode") or "uncategorized").lower()
+            text = entry.get("text", "")
+            time_short = time[11:16] if len(time) >= 16 else time
+            block.append(
+                '<article class="diary-entry">\n'
+                '  <header class="diary-meta">\n'
+                f'    <span class="diary-time">{html.escape(time_short)}</span>\n'
+                f'    <span class="diary-mode diary-mode-{html.escape(mode)}">{html.escape(mode)}</span>\n'
+                '  </header>\n'
+                f'  <p class="diary-text">{html.escape(text)}</p>\n'
+                '</article>'
+            )
+        sections.append("\n".join(block))
+
+    body = "\n\n".join(sections) if sections else "<p>No entries yet.</p>"
+    count = len(entries)
+    rendered_at = datetime.now().strftime("%B %-d, %Y at %H:%M")
+
+    return f"""<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Operator Diary &mdash; {html.escape(STATION.call_sign)}</title>
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <div class="container">
+
+    <nav>
+      <a href="index.html">{html.escape(STATION.call_sign)}</a>
+      <a href="how-to.html">How-To Guide</a>
+      <a href="diary.html" class="active">Diary</a>
+      <a href="https://github.com/keltokhy/writ-fm">GitHub</a>
+    </nav>
+
+    <h1>Operator Diary</h1>
+    <p class="diary-intro">
+      The operator runs every fifteen minutes. After each pass it writes a short
+      note to itself. Future passes read the recent entries before deciding what
+      to do, so this accumulates into something between a logbook and a journal
+      &mdash; the station's continuous voice across runs.
+    </p>
+
+    <p class="diary-stats">{count} entries &middot; last rendered {rendered_at}</p>
+
+{body}
+
+    <footer>
+      <a href="index.html">{html.escape(STATION.call_sign)}</a> &mdash; an experiment in autonomous broadcasting.
+    </footer>
+
+  </div>
+</body>
+</html>
+"""
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description="Render station operator diary to HTML and JSON")
+    parser.add_argument("--html", type=Path, default=DEFAULT_HTML_OUTPUT,
+                        help="HTML output path (default: docs/diary.html)")
+    parser.add_argument("--json", type=Path, default=DEFAULT_JSON_OUTPUT,
+                        help="JSON output path for programmatic consumers (default: docs/diary.json)")
+    args = parser.parse_args()
+
+    entries = load_diary()
+
+    args.html.parent.mkdir(parents=True, exist_ok=True)
+    args.html.write_text(render(entries))
+
+    args.json.parent.mkdir(parents=True, exist_ok=True)
+    feed = {
+        "generated_at": datetime.now().isoformat(timespec="seconds"),
+        "station_id": STATION.id,
+        "station": STATION.call_sign,
+        "count": len(entries),
+        "entries": [
+            {
+                "id": e.get("id"),
+                "time": e.get("time"),
+                "mode": e.get("mode"),
+                "text": e.get("text", ""),
+            }
+            for e in entries
+        ],
+    }
+    args.json.write_text(json.dumps(feed, ensure_ascii=False, indent=2))
+
+    print(f"Wrote {len(entries)} entries to {args.html} and {args.json}")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

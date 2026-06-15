@@ -33,16 +33,19 @@ import os
 os.environ.pop("CLAUDECODE", None)
 
 from helpers import log, preprocess_for_tts, run_claude, render_single_voice, get_audio_duration
-from persona import build_host_prompt, get_host, STATION_NAME
+from persona import build_host_prompt, get_host
+from ledger import append_event, event_id, ingest_messages
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
-SCHEDULE_PATH = PROJECT_ROOT / "config" / "schedule.yaml"
-OUTPUT_DIR = PROJECT_ROOT / "output" / "talk_segments"
-SCRIPTS_DIR = PROJECT_ROOT / "output" / "scripts"
-MESSAGES_FILE = Path.home() / ".writ" / "messages.json"
-
 sys.path.insert(0, str(PROJECT_ROOT / "mac"))
-from schedule import load_schedule
+from station_config import load_station_config  # noqa: E402
+from schedule import load_schedule, slot_key  # noqa: E402
+
+STATION = load_station_config()
+SCHEDULE_PATH = STATION.schedule_path
+OUTPUT_DIR = STATION.talk_dir
+SCRIPTS_DIR = STATION.scripts_dir
+MESSAGES_FILE = STATION.messages_file
 
 # Short segments for quick turnaround
 WORD_TARGET_SINGLE = (100, 200)   # One message: short personal reply
@@ -157,7 +160,7 @@ def build_response_prompt(
 SEGMENT: Listener Response (PRIORITY — these are REAL messages from listeners)
 
 You have received {count} real message{'s' if count > 1 else ''} from listener{'s' if count > 1 else ''} \
-through the {STATION_NAME} website. Respond on air.
+through the {STATION.call_sign} website. Respond on air.
 
 MESSAGES:
 {msg_text}
@@ -194,9 +197,10 @@ def process_messages(max_batch: int = MAX_BATCH) -> int:
     if not unread:
         return 0
 
+    ingest_messages()
     log(f"Found {len(unread)} unread message(s)")
 
-    # Load schedule for current show context
+    # Load schedule for current show context and current slot
     try:
         schedule = load_schedule(SCHEDULE_PATH)
         resolved = schedule.resolve()
@@ -206,6 +210,7 @@ def process_messages(max_batch: int = MAX_BATCH) -> int:
         host_id = resolved.host
         topic_focus = resolved.topic_focus
         voice = dict(resolved.voices).get("host", get_host(host_id)["tts_voice"])
+        slot = slot_key(schedule.airing_start())
     except Exception as e:
         log(f"Schedule error, using defaults: {e}")
         show_id = "midnight_signal"
@@ -214,8 +219,10 @@ def process_messages(max_batch: int = MAX_BATCH) -> int:
         host_id = "liminal_operator"
         topic_focus = "philosophy"
         voice = "am_michael"
+        slot = datetime.now().strftime("%Y-%m-%d_%H00")
 
     log(f"Current show: {show_name} (host: {host_id}, voice: {voice})")
+    log(f"Writing into slot: {slot}")
 
     # Process in batches
     total_processed = 0
@@ -249,11 +256,11 @@ def process_messages(max_batch: int = MAX_BATCH) -> int:
         # Prepare TTS
         processed = preprocess_for_tts(script)
 
-        # Output path
-        show_dir = OUTPUT_DIR / show_id
-        show_dir.mkdir(parents=True, exist_ok=True)
+        # Output path — into current slot folder (plays this airing only)
+        slot_dir = OUTPUT_DIR / show_id / slot
+        slot_dir.mkdir(parents=True, exist_ok=True)
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        output_path = show_dir / f"listener_response_{timestamp}.wav"
+        output_path = slot_dir / f"listener_response_{timestamp}.wav"
 
         log("  Rendering audio...")
         if render_single_voice(processed, output_path, voice):
@@ -265,6 +272,8 @@ def process_messages(max_batch: int = MAX_BATCH) -> int:
             SCRIPTS_DIR.mkdir(parents=True, exist_ok=True)
             meta_path = SCRIPTS_DIR / f"listener_response_{timestamp}.json"
             meta_path.write_text(json.dumps({
+                "station_id": STATION.id,
+                "station": STATION.call_sign,
                 "type": "listener_response",
                 "show_id": show_id,
                 "show_name": show_name,
@@ -276,6 +285,19 @@ def process_messages(max_batch: int = MAX_BATCH) -> int:
                 "voice": voice,
                 "generated_at": datetime.now().isoformat(),
             }, indent=2))
+            append_event({
+                "id": event_id("resp", str(output_path), datetime.now().isoformat(timespec="seconds")),
+                "station_id": STATION.id,
+                "type": "listener_response_generated",
+                "time": datetime.now().isoformat(timespec="seconds"),
+                "show_id": show_id,
+                "host": host_id,
+                "messages": [m["message"] for m in batch],
+                "path": str(output_path),
+                "word_count": word_count,
+                "duration_seconds": duration,
+                "tags": ["listener_response", show_id],
+            })
         else:
             log("  TTS rendering failed")
 

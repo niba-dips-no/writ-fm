@@ -6,14 +6,17 @@ Tracks all played tracks to prevent repeats and enable analytics.
 Uses SQLite for persistent storage.
 """
 
-import sqlite3
 import json
+import sqlite3
+import sys
 from pathlib import Path
-from datetime import datetime, timedelta
 from typing import Optional
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from station_config import load_station_config  # noqa: E402
+
 # Default database location
-DEFAULT_DB_PATH = Path.home() / ".writ" / "history.db"
+DEFAULT_DB_PATH = load_station_config().history_db_path
 
 
 class PlayHistory:
@@ -67,20 +70,6 @@ class PlayHistory:
             )
             conn.commit()
 
-    def was_played_recently(self, filepath: str, hours: int = 24) -> bool:
-        """Check if track was played within the last N hours."""
-        cutoff = datetime.now() - timedelta(hours=hours)
-        with sqlite3.connect(self.db_path) as conn:
-            cursor = conn.execute(
-                """
-                SELECT COUNT(*) FROM plays
-                WHERE filepath = ? AND played_at > ?
-                """,
-                (filepath, cutoff.isoformat()),
-            )
-            count = cursor.fetchone()[0]
-            return count > 0
-
     def get_recent_plays(self, limit: int = 50) -> list[dict]:
         """Get recent plays."""
         with sqlite3.connect(self.db_path) as conn:
@@ -95,6 +84,19 @@ class PlayHistory:
                 (limit,),
             )
             return [dict(row) for row in cursor.fetchall()]
+
+    def get_recent_filepaths(self, hours: int = 4) -> set[str]:
+        """Get filepaths played within the last N hours."""
+        with sqlite3.connect(self.db_path) as conn:
+            cursor = conn.execute(
+                """
+                SELECT DISTINCT filepath
+                FROM plays
+                WHERE played_at >= datetime('now', ?)
+                """,
+                (f"-{hours} hours",),
+            )
+            return {row[0] for row in cursor.fetchall()}
 
     def get_play_count(self, filepath: str) -> int:
         """Get total play count for a track."""
@@ -178,11 +180,6 @@ class PlayHistory:
                 "first_play": first,
                 "last_play": last,
             }
-
-    def filter_recent(self, tracks: list[Path], hours: int = 24) -> list[Path]:
-        """Filter out tracks played recently."""
-        return [t for t in tracks if not self.was_played_recently(str(t), hours)]
-
 
 # Global instance for easy import
 _history: Optional[PlayHistory] = None
